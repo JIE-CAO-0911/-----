@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -45,9 +46,9 @@ def save_config(path, config):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(config, fh, indent=2, ensure_ascii=False)
             fh.write("\n")
-        st.success("配置已保存。")
+        st.success("已保存")
     except Exception as exc:
-        st.error(f"保存配置失败：{exc}")
+        st.error(f"保存失败：{exc}")
 
 
 def ensure_session_state():
@@ -66,8 +67,8 @@ def ensure_session_state():
         st.session_state.match_result_df = None
     if "summary" not in st.session_state:
         st.session_state.summary = None
-    if "orders_path" not in st.session_state:
-        st.session_state.orders_path = default_orders_path()
+    if "orders_paths_text" not in st.session_state:
+        st.session_state.orders_paths_text = default_orders_path()
     if "pdf_dir" not in st.session_state:
         st.session_state.pdf_dir = str(APP_DIR / "发票PDF")
     if "config_path" not in st.session_state:
@@ -119,29 +120,38 @@ def style_match_rows(row, color_map):
         return ["" for _ in row]
     return [f"background-color: {color}; color: #000" for _ in row]
 
-def select_order_file():
+
+def parse_orders_paths(text):
+    if not text:
+        return []
+    flat = text.replace(";", "\n")
+    paths = [line.strip() for line in flat.splitlines() if line.strip()]
+    return paths
+
+
+def select_order_files():
     if not TK_AVAILABLE:
-        st.warning("当前环境无法打开文件选择窗口，请手动输入路径。")
-        return None
+        st.warning("无法打开选择窗口，请手动输入路径。")
+        return []
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    path = filedialog.askopenfilename(
+    paths = filedialog.askopenfilenames(
         title="选择订单文件",
         filetypes=[("Excel 文件", "*.xlsx"), ("所有文件", "*.*")],
     )
     root.destroy()
-    return path or None
+    return list(paths) if paths else []
 
 
 def select_pdf_folder():
     if not TK_AVAILABLE:
-        st.warning("当前环境无法打开文件夹选择窗口，请手动输入路径。")
+        st.warning("无法打开选择窗口，请手动输入路径。")
         return None
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    path = filedialog.askdirectory(title="选择发票 PDF 文件夹")
+    path = filedialog.askdirectory(title="选择发票文件夹")
     root.destroy()
     return path or None
 
@@ -149,19 +159,19 @@ def select_pdf_folder():
 def render_config_tab(config_path):
     config = load_config(config_path)
 
-    st.subheader("订单列映射")
+    st.subheader("列映射")
     order_cols = config.get("order_columns", {})
     col1, col2 = st.columns(2)
     with col1:
         order_id = st.text_input("订单号", value=order_cols.get("order_id", ""))
-        amount = st.text_input("实付金额", value=order_cols.get("amount", ""))
-        date_col = st.text_input("订单时间", value=order_cols.get("date", ""))
+        amount = st.text_input("实付", value=order_cols.get("amount", ""))
+        date_col = st.text_input("时间", value=order_cols.get("date", ""))
     with col2:
-        vendor = st.text_input("店铺名称", value=order_cols.get("vendor", ""))
-        description = st.text_input("商品名称", value=order_cols.get("description", ""))
-        status = st.text_input("订单状态", value=order_cols.get("status", ""))
+        vendor = st.text_input("店铺", value=order_cols.get("vendor", ""))
+        description = st.text_input("商品", value=order_cols.get("description", ""))
+        status = st.text_input("状态", value=order_cols.get("status", ""))
 
-    st.subheader("匹配规则")
+    st.subheader("规则")
     rules = config.get("match_rules", {})
     r1, r2, r3 = st.columns(3)
     with r1:
@@ -169,14 +179,14 @@ def render_config_tab(config_path):
             "金额容差", value=float(rules.get("amount_tolerance", 0.01)), step=0.01
         )
         min_score = st.number_input(
-            "最低匹配分", value=float(rules.get("min_score", 0.7)), step=0.05
+            "最低分", value=float(rules.get("min_score", 0.7)), step=0.05
         )
     with r2:
         date_tol = st.number_input(
-            "日期容差(天)", value=int(rules.get("date_days_tolerance", 7)), step=1
+            "日期(天)", value=int(rules.get("date_days_tolerance", 7)), step=1
         )
         vendor_thresh = st.number_input(
-            "店铺相似度阈值",
+            "相似度",
             value=float(rules.get("vendor_similarity_threshold", 0.6)),
             min_value=0.0,
             max_value=1.0,
@@ -184,11 +194,11 @@ def render_config_tab(config_path):
         )
     with r3:
         allow_dupe = st.checkbox(
-            "允许一个订单匹配多张发票",
+            "允许多票",
             value=bool(rules.get("allow_duplicate_orders", False)),
         )
         merge_items = st.checkbox(
-            "合并多行商品",
+            "合并明细",
             value=bool(rules.get("merge_multi_item_orders", True)),
         )
 
@@ -211,19 +221,21 @@ def render_config_tab(config_path):
         save_config(config_path, config)
 
 
-def render_preprocess_tab(orders_path, config_path):
-    st.subheader("订单预处理")
-    st.caption("先解析订单，编辑或删除后再进行匹配。")
+def render_preprocess_tab(orders_paths, config_path):
+    st.subheader("预处理")
 
     col1, col2 = st.columns([1, 3])
     with col1:
-        if st.button("解析订单"):
+        if st.button("解析"):
             try:
                 config = matcher.load_config(config_path)
-                orders_df = matcher.load_orders(orders_path, config)
+                if not orders_paths:
+                    st.error("请选择订单文件")
+                    return
+                orders_df = matcher.load_orders_multi(orders_paths, config)
                 st.session_state.order_df = orders_df_for_editor(orders_df)
                 st.session_state.match_result_df = None
-                st.success(f"已解析 {len(st.session_state.order_df)} 条订单。")
+                st.success(f"已解析 {len(st.session_state.order_df)} 条")
             except Exception as exc:
                 st.error(f"解析失败：{exc}")
 
@@ -237,39 +249,39 @@ def render_preprocess_tab(orders_path, config_path):
 
     action_col1, action_col2, action_col3 = st.columns([1, 1, 2])
     with action_col1:
-        if st.button("应用编辑"):
+        if st.button("应用"):
             st.session_state.order_df = editor_df.reset_index(drop=True)
             st.session_state.match_result_df = None
-            st.success("订单列表已更新。")
+            st.success("已更新")
     with action_col2:
         delete_targets = st.multiselect(
-            "删除行(按序号)",
+            "删除行",
             options=list(editor_df.index),
             format_func=lambda idx: f"{idx} | {editor_df.loc[idx, 'order_id']}",
         )
-        if st.button("删除选中"):
+        if st.button("删除"):
             st.session_state.order_df = editor_df.drop(delete_targets).reset_index(drop=True)
             st.session_state.match_result_df = None
-            st.success("已删除选中订单。")
+            st.success("已删除")
     with action_col3:
-        if st.button("清空列表"):
+        if st.button("清空"):
             st.session_state.order_df = st.session_state.order_df.iloc[0:0]
             st.session_state.match_result_df = None
-            st.info("订单列表已清空。")
+            st.info("已清空")
 
-    with st.expander("新增订单"):
+    with st.expander("新增"):
         new_cols = st.columns(3)
         with new_cols[0]:
-            new_order_id = st.text_input("订单号(新增)", key="new_order_id")
-            new_vendor = st.text_input("店铺名称(新增)", key="new_vendor")
+            new_order_id = st.text_input("订单号", key="new_order_id")
+            new_vendor = st.text_input("店铺", key="new_vendor")
         with new_cols[1]:
-            new_desc = st.text_input("明细(新增)", key="new_desc")
-            new_amount = st.text_input("实付金额(新增)", key="new_amount")
+            new_desc = st.text_input("明细", key="new_desc")
+            new_amount = st.text_input("实付", key="new_amount")
         with new_cols[2]:
-            new_status = st.text_input("订单状态(新增)", key="new_status")
-            new_date = st.text_input("订单时间(新增)", key="new_date")
+            new_status = st.text_input("状态", key="new_status")
+            new_date = st.text_input("时间", key="new_date")
 
-        if st.button("添加订单"):
+        if st.button("添加"):
             amount_value = matcher.parse_amount(new_amount) if new_amount else None
             new_row = {
                 "order_id": matcher.format_order_id(new_order_id),
@@ -284,14 +296,15 @@ def render_preprocess_tab(orders_path, config_path):
                 ignore_index=True,
             )
             st.session_state.match_result_df = None
-            st.success("已添加订单。")
+            st.success("已添加")
 
 
-def render_match_tab(orders_path, pdf_dir, config_path, output_path, recursive, color_map):
-    st.subheader("发票匹配")
-    st.caption(f"订单文件：{orders_path} ｜ 发票文件夹：{pdf_dir}")
+def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive, color_map):
+    st.subheader("匹配")
+    orders_hint = f"{len(orders_paths)} 个文件" if orders_paths else "未选择"
+    st.caption(f"订单：{orders_hint} ｜ 发票：{pdf_dir}")
 
-    if st.button("开始匹配"):
+    if st.button("开始"):
         config = load_config(config_path)
         config.setdefault("match_rules", {})
         config["match_rules"]["vendor_similarity_threshold"] = float(
@@ -300,23 +313,26 @@ def render_match_tab(orders_path, pdf_dir, config_path, output_path, recursive, 
         try:
             backend = matcher.resolve_pdf_backend()
             if backend is None:
-                st.error("缺少 PDF 解析库，请安装 pdfplumber 或 pypdf。")
+                st.error("缺少 PDF 解析库")
                 return
 
             if st.session_state.order_df is not None and not st.session_state.order_df.empty:
                 order_rows = editor_df_to_rows(st.session_state.order_df)
                 orders_df = matcher.build_orders_df_from_rows(order_rows)
             else:
-                orders_df = matcher.load_orders(orders_path, config)
+                if not orders_paths:
+                    st.error("请选择订单文件")
+                    return
+                orders_df = matcher.load_orders_multi(orders_paths, config)
 
             pdf_root = Path(pdf_dir)
             if not pdf_root.exists():
-                st.error("发票文件夹路径无效。")
+                st.error("发票路径无效")
                 return
 
             pdfs = matcher.find_pdfs(pdf_dir, recursive)
             if not pdfs:
-                st.error("未找到任何 PDF 文件。")
+                st.error("未找到 PDF")
                 return
 
             progress = st.progress(0)
@@ -356,22 +372,22 @@ def render_match_tab(orders_path, pdf_dir, config_path, output_path, recursive, 
                 "matches": len(matches),
                 "output": output_path,
             }
-            st.success("匹配完成。")
+            st.success("完成")
         except Exception as exc:
-            st.error(f"匹配失败：{exc}")
+            st.error(f"失败：{exc}")
 
     if st.session_state.summary:
         summary = st.session_state.summary
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("订单数", summary["orders"])
-        m2.metric("发票数", summary["invoices"])
-        m3.metric("匹配数", summary["matches"])
-        m4.metric("输出文件", Path(summary["output"]).name)
+        m1.metric("订单", summary["orders"])
+        m2.metric("发票", summary["invoices"])
+        m3.metric("匹配", summary["matches"])
+        m4.metric("输出", Path(summary["output"]).name)
 
     if st.session_state.match_result_df is not None:
-        st.markdown("### 匹配结果")
+        st.markdown("### 结果")
         status_filter = st.selectbox(
-            "订单状态筛选",
+            "状态筛选",
             options=["全部"]
             + sorted(
                 {
@@ -393,55 +409,55 @@ def render_match_tab(orders_path, pdf_dir, config_path, output_path, recursive, 
 
 
 def main():
-    st.set_page_config(page_title="发票/订单匹配助手", layout="wide")
+    st.set_page_config(page_title="发票匹配", layout="wide")
     ensure_session_state()
 
-    st.title("发票/订单匹配助手（Streamlit 版）")
+    st.title("发票匹配")
 
     with st.sidebar:
-        st.header("文件选择")
+        st.header("文件")
         select_col1, select_col2 = st.columns([1, 3])
         with select_col1:
-            if st.button("选择订单文件"):
-                chosen = select_order_file()
+            if st.button("选订单"):
+                chosen = select_order_files()
                 if chosen:
-                    st.session_state.orders_path = chosen
+                    st.session_state.orders_paths_text = "\n".join(chosen)
         with select_col2:
-            st.text_input("订单文件 (.xlsx)", key="orders_path")
+            st.text_area("订单文件(多选)", key="orders_paths_text", height=80)
 
         select_col3, select_col4 = st.columns([1, 3])
         with select_col3:
-            if st.button("选择发票文件夹"):
+            if st.button("选发票"):
                 chosen = select_pdf_folder()
                 if chosen:
                     st.session_state.pdf_dir = chosen
         with select_col4:
-            st.text_input("发票 PDF 文件夹", key="pdf_dir")
+            st.text_input("发票文件夹", key="pdf_dir")
 
-        recursive = st.checkbox("递归扫描子文件夹", value=False)
+        recursive = st.checkbox("递归扫描", value=False)
 
-        with st.expander("设置面板", expanded=True):
-            st.text_input("配置文件 (.json)", key="config_path")
-            st.text_input("输出结果", key="output_path")
-            st.subheader("疑似匹配阈值")
+        with st.expander("设置", expanded=True):
+            st.text_input("配置文件", key="config_path")
+            st.text_input("输出文件", key="output_path")
+            st.subheader("疑似阈值")
             st.slider(
-                "店铺相似度阈值",
+                "相似度",
                 min_value=0.0,
                 max_value=1.0,
                 step=0.05,
                 key="suspect_threshold",
             )
-            st.subheader("颜色规则")
-            st.color_picker("完美匹配", key="color_perfect")
-            st.color_picker("疑似匹配", key="color_suspect")
+            st.subheader("颜色")
+            st.color_picker("完美", key="color_perfect")
+            st.color_picker("疑似", key="color_suspect")
             st.color_picker("无匹配", key="color_nomatch")
 
-    orders_path = st.session_state.orders_path
+    orders_paths = parse_orders_paths(st.session_state.orders_paths_text)
     pdf_dir = st.session_state.pdf_dir
     config_path = st.session_state.config_path
     output_path = st.session_state.output_path
 
-    tab1, tab2, tab3 = st.tabs(["订单预处理", "匹配", "配置"])
+    tab1, tab2, tab3 = st.tabs(["预处理", "匹配", "配置"])
     color_map = {
         "完美匹配": st.session_state.color_perfect,
         "疑似匹配": st.session_state.color_suspect,
@@ -449,10 +465,10 @@ def main():
     }
 
     with tab1:
-        render_preprocess_tab(orders_path, config_path)
+        render_preprocess_tab(orders_paths, config_path)
     with tab2:
         render_match_tab(
-            orders_path,
+            orders_paths,
             pdf_dir,
             config_path,
             output_path,

@@ -450,6 +450,30 @@ def load_orders(orders_path, config):
     return df
 
 
+def load_orders_multi(orders_paths, config):
+    if isinstance(orders_paths, (str, Path)):
+        return load_orders(orders_paths, config)
+
+    paths = [str(p).strip() for p in orders_paths if str(p).strip()]
+    if not paths:
+        die("Orders file list is empty.")
+
+    frames = [load_orders(path, config) for path in paths]
+    if len(frames) == 1:
+        return frames[0]
+
+    try:
+        import pandas as pd
+    except ImportError:
+        die("Missing dependency: pandas. Install with `pip install pandas openpyxl`.")
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["_match_invoice_file"] = None
+    combined["_match_invoice_id"] = None
+    combined["_match_score"] = None
+    return combined
+
+
 def merge_multi_item_orders(df, config):
     rules = config.get("match_rules", {})
     if not rules.get("merge_multi_item_orders", True):
