@@ -1,0 +1,37 @@
+{
+  "order_columns": {
+    "order_id": "订单号",
+    "amount": "实付金额",
+    "date": "订单提交时间",
+    "vendor": "店铺名称",
+    "description": "商品名称"
+  },
+  "invoice_patterns": {
+    "invoice_id": [
+      "invoice\\s*(?:no|number)\\s*[:]?\\s*([A-Za-z0-9-]{5,})",
+      "no\\.?\\s*[:]?\\s*([A-Za-z0-9-]{5,})"
+    ],
+    "amount": [
+      "(?:total|amount\\s*due|amount)\\s*[:]?\\s*([$0-9,]+(?:\\.[0-9]{2})?)",
+      "(?:价税合计|金额合计|合计|总金额|应付|实付|小写)\\s*[:：]?\\s*([¥￥]?[0-9,]+(?:\\.[0-9]{1,2})?)"
+    ],
+    "date": [
+      "(?:invoice\\s*date|date)\\s*[:]?\\s*([0-9]{4}[-/\\.][0-9]{1,2}[-/\\.][0-9]{1,2})"
+    ],
+    "vendor": [
+      "(?:seller|vendor|merchant|supplier)\\s*[:]?\\s*([A-Za-z0-9 &.,-]{3,})"
+    ]
+  },
+  "match_rules": {
+    "amount_tolerance": 0.01,
+    "amount_tolerance_ratio": 0.0,
+    "date_days_tolerance": 30,
+    "weights": {
+      "amount": 0.6,
+      "date": 0.2,
+      "vendor": 0.2
+    },
+    "min_score": 0.7,
+    "allow_duplicate_orders": false
+  }
+}
