@@ -5,6 +5,7 @@ import math
 import re
 import sys
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -16,6 +17,7 @@ DEFAULT_CONFIG = {
         "date": "",
         "vendor": "",
         "description": "",
+        "status": "",
     },
     "invoice_patterns": {
         "invoice_id": [
@@ -40,6 +42,8 @@ DEFAULT_CONFIG = {
         "weights": {"amount": 0.6, "date": 0.2, "vendor": 0.2},
         "min_score": 0.7,
         "allow_duplicate_orders": False,
+        "vendor_similarity_threshold": 0.6,
+        "merge_multi_item_orders": True,
     },
 }
 
@@ -50,7 +54,11 @@ ORDER_CANDIDATES = {
     "date": {"date", "orderdate", "createdate", "paydate"},
     "vendor": {"vendor", "merchant", "seller", "supplier", "company"},
     "description": {"description", "item", "details", "notes"},
+    "status": {"status", "orderstatus", "order_state", "state"},
 }
+
+MODEL_CANDIDATES = {"型号款式", "型号", "规格", "规格型号"}
+QTY_CANDIDATES = {"商品数量", "数量", "qty", "quantity"}
 
 
 NUM_RE = re.compile(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?")
@@ -92,6 +100,44 @@ def normalize_key(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
+def normalize_text(value):
+    if value is None:
+        return ""
+    try:
+        import pandas as pd
+
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {"nan", "none"}:
+        return ""
+    return text
+
+
+def format_order_id(value):
+    if value is None:
+        return ""
+    if isinstance(value, (int,)):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        if abs(value - round(value)) < 0.000001:
+            return str(int(round(value)))
+    text = normalize_text(value)
+    if not text:
+        return ""
+    try:
+        dec = Decimal(text)
+    except InvalidOperation:
+        return text
+    if dec == dec.to_integral():
+        return format(dec.quantize(Decimal(1)), "f").split(".")[0]
+    return format(dec.normalize(), "f").rstrip("0").rstrip(".")
+
+
 def pick_column(columns, configured, candidates):
     if configured:
         return configured if configured in columns else None
@@ -121,6 +167,27 @@ def parse_amount(value):
         return float(text) if text else None
     except ValueError:
         return None
+
+
+def amount_key(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return round(float(value), 2)
+    try:
+        return round(float(value), 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def amounts_equal(left, right):
+    left_key = amount_key(left)
+    right_key = amount_key(right)
+    if left_key is None or right_key is None:
+        return False
+    return left_key == right_key
 
 
 def parse_date(value):
@@ -355,14 +422,141 @@ def load_orders(orders_path, config):
     desc_col = pick_column(
         columns, order_cols.get("description"), ORDER_CANDIDATES["description"]
     )
+    status_col = pick_column(
+        columns, order_cols.get("status"), ORDER_CANDIDATES["status"]
+    )
+    if status_col is None and "订单状态" in columns:
+        status_col = "订单状态"
 
-    df["_order_id"] = df[order_id_col].astype(str).str.strip() if order_id_col else ""
+    df["_order_id"] = df[order_id_col].apply(format_order_id) if order_id_col else ""
     df["_amount"] = df[amount_col].apply(parse_amount)
     df["_date"] = df[date_col].apply(parse_date) if date_col else None
-    df["_vendor"] = df[vendor_col].apply(lambda x: str(x).strip()) if vendor_col else ""
-    df["_description"] = (
-        df[desc_col].apply(lambda x: str(x).strip()) if desc_col else ""
+    df["_vendor"] = (
+        df[vendor_col].apply(normalize_text) if vendor_col else ""
     )
+    df["_description"] = (
+        df[desc_col].apply(normalize_text) if desc_col else ""
+    )
+    df["_status"] = (
+        df[status_col].apply(normalize_text) if status_col else ""
+    )
+
+    df = merge_multi_item_orders(df, config)
+
+    df["_match_invoice_file"] = None
+    df["_match_invoice_id"] = None
+    df["_match_score"] = None
+
+    return df
+
+
+def merge_multi_item_orders(df, config):
+    rules = config.get("match_rules", {})
+    if not rules.get("merge_multi_item_orders", True):
+        return df
+    if "_order_id" not in df.columns:
+        return df
+
+    group_id = df["_order_id"].replace("", None).ffill()
+    if group_id.isna().all():
+        return df
+    import pandas as pd
+
+    group_id = group_id.fillna(pd.Series(df.index.astype(str), index=df.index))
+    df = df.copy()
+    df["_group_id"] = group_id
+
+    model_col = next((c for c in df.columns if c in MODEL_CANDIDATES), None)
+    qty_col = next((c for c in df.columns if c in QTY_CANDIDATES), None)
+
+    def build_line_item(row):
+        base = normalize_text(row.get("_description", ""))
+        if not base:
+            return ""
+        model = normalize_text(row.get(model_col)) if model_col else ""
+        qty = normalize_text(row.get(qty_col)) if qty_col else ""
+        if model:
+            base = f"{base} ({model})"
+        if qty:
+            base = f"{base} x{qty}"
+        return base
+
+    df["_line_item"] = df.apply(build_line_item, axis=1)
+
+    def first_non_empty(series):
+        for value in series:
+            if normalize_text(value):
+                return value
+        return ""
+
+    def first_not_null(series):
+        for value in series:
+            if value is not None:
+                return value
+        return None
+
+    def merge_lines(series):
+        seen = set()
+        merged = []
+        for value in series:
+            text = normalize_text(value)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+        return " | ".join(merged)
+
+    grouped = df.groupby("_group_id", sort=False)
+    merged = grouped.agg(
+        {
+            "_order_id": first_non_empty,
+            "_amount": first_not_null,
+            "_date": first_not_null,
+            "_vendor": first_non_empty,
+            "_description": merge_lines,
+            "_status": first_non_empty,
+            "_line_item": merge_lines,
+        }
+    )
+    merged["_description"] = merged["_line_item"].where(
+        merged["_line_item"] != "", merged["_description"]
+    )
+    merged = merged.drop(columns=["_line_item"])
+    merged = merged.reset_index(drop=True)
+    return merged
+
+
+def build_orders_df_from_rows(rows):
+    try:
+        import pandas as pd
+    except ImportError:
+        die("Missing dependency: pandas. Install with `pip install pandas openpyxl`.")
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["order_id", "vendor", "description", "amount", "order_status"])
+
+    def col_or_empty(name):
+        if name in df.columns:
+            return df[name]
+        return pd.Series([""] * len(df), index=df.index)
+
+    df["_order_id"] = col_or_empty("order_id").apply(format_order_id)
+    df["_vendor"] = col_or_empty("vendor").apply(normalize_text)
+    df["_description"] = col_or_empty("description").apply(normalize_text)
+    df["_amount"] = col_or_empty("amount").apply(parse_amount)
+
+    if "order_status" in df.columns:
+        df["_status"] = df["order_status"].apply(normalize_text)
+    else:
+        df["_status"] = col_or_empty("status").apply(normalize_text)
+
+    if "order_date" in df.columns:
+        df["_date"] = df["order_date"].apply(parse_date)
+    elif "date" in df.columns:
+        df["_date"] = df["date"].apply(parse_date)
+    else:
+        df["_date"] = None
 
     df["_match_invoice_file"] = None
     df["_match_invoice_id"] = None
@@ -446,6 +640,22 @@ def score_vendor(inv_vendor, order_vendor):
     if not left or not right:
         return None
     return SequenceMatcher(None, left, right).ratio()
+
+
+def max_vendor_similarity(order_vendor, invoice_vendor_norms):
+    left = normalize_vendor(order_vendor)
+    if not left:
+        return 0.0
+    best = 0.0
+    for right in invoice_vendor_norms:
+        if not right:
+            continue
+        score = SequenceMatcher(None, left, right).ratio()
+        if score > best:
+            best = score
+            if best >= 0.99:
+                break
+    return best
 
 
 def match_orders_invoices(orders_df, invoices, config):
@@ -539,6 +749,73 @@ def match_orders_invoices(orders_df, invoices, config):
     return matches
 
 
+def compute_order_match_statuses(orders_df, invoices, matches, config):
+    rules = config.get("match_rules", {})
+    vendor_threshold = float(rules.get("vendor_similarity_threshold", 0.6))
+
+    invoice_amount_counts = {}
+    invoice_vendor_norms = []
+    for invoice in invoices:
+        key = amount_key(invoice.get("amount"))
+        if key is not None:
+            invoice_amount_counts[key] = invoice_amount_counts.get(key, 0) + 1
+        invoice_vendor_norms.append(normalize_vendor(invoice.get("vendor")))
+
+    match_by_order = {int(item["order_row"]): item for item in matches}
+    status_map = {}
+
+    for order_idx, order in orders_df.iterrows():
+        order_amount_key = amount_key(order["_amount"])
+        amount_match_count = (
+            invoice_amount_counts.get(order_amount_key, 0)
+            if order_amount_key is not None
+            else 0
+        )
+        matched = match_by_order.get(int(order_idx))
+        matched_amount_ok = False
+        if matched:
+            matched_amount_ok = amounts_equal(
+                order["_amount"], matched.get("invoice_amount")
+            )
+
+        vendor_match = False
+        if order["_vendor"]:
+            vendor_match = (
+                max_vendor_similarity(order["_vendor"], invoice_vendor_norms)
+                >= vendor_threshold
+            )
+
+        if matched and matched_amount_ok and amount_match_count == 1:
+            status = "完美匹配"
+            reason = "金额一致且唯一匹配"
+            color = "green"
+        elif amount_match_count > 1:
+            status = "疑似匹配"
+            reason = "金额对应多张发票"
+            color = "orange"
+        elif vendor_match and amount_match_count == 0:
+            status = "疑似匹配"
+            reason = "开票单位相近但金额不一致"
+            color = "orange"
+        elif matched:
+            status = "疑似匹配"
+            reason = "匹配未满足完美条件"
+            color = "orange"
+        else:
+            status = "无匹配"
+            reason = "未找到匹配发票"
+            color = "red"
+
+        status_map[order_idx] = {
+            "status": status,
+            "reason": reason,
+            "color": color,
+            "amount_match_count": amount_match_count,
+        }
+
+    return status_map
+
+
 def write_output(out_path, orders_df, invoices, matches):
     try:
         import pandas as pd
@@ -594,6 +871,13 @@ def run_matching(orders_path, pdf_dir, config_path, out_path, recursive=False):
 
     invoices = [extract_invoice(path, config, backend) for path in pdfs]
     matches = match_orders_invoices(orders_df, invoices, config)
+    status_map = compute_order_match_statuses(orders_df, invoices, matches, config)
+    orders_df["_match_status"] = orders_df.index.map(
+        lambda idx: status_map.get(idx, {}).get("status", "")
+    )
+    orders_df["_match_reason"] = orders_df.index.map(
+        lambda idx: status_map.get(idx, {}).get("reason", "")
+    )
     write_output(out_path, orders_df, invoices, matches)
 
     return {

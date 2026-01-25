@@ -4,7 +4,8 @@
     "amount": "实付金额",
     "date": "订单提交时间",
     "vendor": "店铺名称",
-    "description": "商品名称"
+    "description": "商品名称",
+    "status": "订单状态"
   },
   "invoice_patterns": {
     "invoice_id": [
@@ -32,6 +33,8 @@
       "vendor": 0.2
     },
     "min_score": 0.7,
-    "allow_duplicate_orders": false
+    "allow_duplicate_orders": false,
+    "vendor_similarity_threshold": 0.6,
+    "merge_multi_item_orders": true
   }
 }

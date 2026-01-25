@@ -26,6 +26,7 @@ PREFERRED_COLUMNS = {
     "date": ["订单提交时间", "下单时间", "支付时间", "订单时间"],
     "vendor": ["店铺名称", "店铺", "商家", "卖家"],
     "description": ["商品名称", "商品", "明细", "描述"],
+    "status": ["订单状态", "状态"],
 }
 
 
@@ -80,6 +81,15 @@ def parse_int(text, fallback):
         return fallback
 
 
+def format_amount(value):
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.2f}"
+    except (ValueError, TypeError):
+        return str(value).strip()
+
+
 class InvoiceMatcherGUI:
     def __init__(self, root):
         self.root = root
@@ -112,11 +122,17 @@ class InvoiceMatcherGUI:
             "date": tk.StringVar(),
             "vendor": tk.StringVar(),
             "description": tk.StringVar(),
+            "status": tk.StringVar(),
         }
         self.amount_tol_var = tk.StringVar(value="0.01")
         self.date_tol_var = tk.StringVar(value="7")
         self.min_score_var = tk.StringVar(value="0.7")
         self.allow_dupe_var = tk.BooleanVar(value=False)
+        self.status_filter_var = tk.StringVar(value="全部")
+        self.order_rows = []
+        self.order_tree = None
+        self.use_preprocessed_orders = False
+        self.next_row_id = 1
 
         self._build_ui()
         self._load_config_to_ui()
@@ -137,11 +153,14 @@ class InvoiceMatcherGUI:
         notebook.pack(fill="both", expand=True)
 
         self.match_tab = ttk.Frame(notebook)
+        self.list_tab = ttk.Frame(notebook)
         self.config_tab = ttk.Frame(notebook)
         notebook.add(self.match_tab, text="匹配")
+        notebook.add(self.list_tab, text="订单列表")
         notebook.add(self.config_tab, text="配置")
 
         self._build_match_tab()
+        self._build_list_tab()
         self._build_config_tab()
 
     def _build_match_tab(self):
@@ -203,6 +222,90 @@ class InvoiceMatcherGUI:
         status_frame.columnconfigure(0, weight=1)
         ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
 
+    def _build_list_tab(self):
+        self.list_tab.columnconfigure(0, weight=1)
+        self.list_tab.rowconfigure(1, weight=1)
+
+        filter_frame = ttk.LabelFrame(self.list_tab, text="筛选")
+        filter_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=10)
+        filter_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(filter_frame, text="订单状态").grid(
+            row=0, column=0, sticky="w", padx=6, pady=6
+        )
+        self.status_filter_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.status_filter_var,
+            values=["全部"],
+            state="readonly",
+        )
+        self.status_filter_combo.grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        self.status_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_order_filter())
+
+        ttk.Button(filter_frame, text="应用筛选", command=self._apply_order_filter).grid(
+            row=0, column=2, sticky="w", padx=6, pady=6
+        )
+
+        action_frame = ttk.Frame(filter_frame)
+        action_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        ttk.Button(action_frame, text="解析订单", command=self._parse_orders).pack(
+            side="left"
+        )
+        ttk.Button(action_frame, text="新增订单", command=self._add_manual_order).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(action_frame, text="删除选中", command=self._delete_selected_orders).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(action_frame, text="清空列表", command=self._clear_order_list).pack(
+            side="left", padx=(8, 0)
+        )
+
+        tree_frame = ttk.Frame(self.list_tab)
+        tree_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = (
+            "order_id",
+            "vendor",
+            "description",
+            "amount",
+            "order_status",
+            "match_status",
+            "match_reason",
+        )
+        self.order_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings", height=18
+        )
+        self.order_tree.heading("order_id", text="订单号")
+        self.order_tree.heading("vendor", text="店铺名称")
+        self.order_tree.heading("description", text="明细")
+        self.order_tree.heading("amount", text="实付金额")
+        self.order_tree.heading("order_status", text="订单状态")
+        self.order_tree.heading("match_status", text="匹配结果")
+        self.order_tree.heading("match_reason", text="说明")
+
+        self.order_tree.column("order_id", width=140, anchor="w", stretch=False)
+        self.order_tree.column("vendor", width=160, anchor="w", stretch=True)
+        self.order_tree.column("description", width=240, anchor="w", stretch=True)
+        self.order_tree.column("amount", width=90, anchor="e", stretch=False)
+        self.order_tree.column("order_status", width=100, anchor="w", stretch=False)
+        self.order_tree.column("match_status", width=90, anchor="center", stretch=False)
+        self.order_tree.column("match_reason", width=180, anchor="w", stretch=True)
+
+        self.order_tree.tag_configure("green", background="#d6f5d6")
+        self.order_tree.tag_configure("orange", background="#ffe9c6")
+        self.order_tree.tag_configure("red", background="#ffd6d6")
+
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.order_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.order_tree.xview)
+        self.order_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+
+        self.order_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
+
     def _build_config_tab(self):
         self.config_tab.columnconfigure(0, weight=1)
         self.config_tab.rowconfigure(2, weight=1)
@@ -237,11 +340,14 @@ class InvoiceMatcherGUI:
         self._add_combo_row(
             mapping_frame, 4, "商品名称", self.column_vars["description"]
         )
+        self._add_combo_row(
+            mapping_frame, 5, "订单状态", self.column_vars["status"]
+        )
 
         read_columns_button = ttk.Button(
             mapping_frame, text="读取订单列名", command=self._load_columns_from_orders
         )
-        read_columns_button.grid(row=5, column=0, pady=(6, 8), sticky="w")
+        read_columns_button.grid(row=6, column=0, pady=(6, 8), sticky="w")
 
         rules_frame = ttk.LabelFrame(self.config_tab, text="匹配规则")
         rules_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 10))
@@ -383,6 +489,7 @@ class InvoiceMatcherGUI:
         self.column_vars["date"].set(order_cols.get("date", ""))
         self.column_vars["vendor"].set(order_cols.get("vendor", ""))
         self.column_vars["description"].set(order_cols.get("description", ""))
+        self.column_vars["status"].set(order_cols.get("status", ""))
 
         rules = config.get("match_rules", {})
         self.amount_tol_var.set(str(rules.get("amount_tolerance", 0.01)))
@@ -418,6 +525,7 @@ class InvoiceMatcherGUI:
             "date": self.column_vars["date"].get().strip(),
             "vendor": self.column_vars["vendor"].get().strip(),
             "description": self.column_vars["description"].get().strip(),
+            "status": self.column_vars["status"].get().strip(),
         }
         config.setdefault("match_rules", {})
         config["match_rules"]["amount_tolerance"] = parse_float(
@@ -453,9 +561,11 @@ class InvoiceMatcherGUI:
         config_path = self.config_var.get().strip()
         output_path = self.output_var.get().strip()
 
+        use_preprocessed = bool(self.use_preprocessed_orders and self.order_rows)
         if not orders_path or not Path(orders_path).exists():
-            messagebox.showerror("缺少文件", "请选择有效的订单文件。")
-            return
+            if not use_preprocessed:
+                messagebox.showerror("缺少文件", "请选择有效的订单文件，或先解析订单列表。")
+                return
         if not pdf_dir or not Path(pdf_dir).exists():
             messagebox.showerror("缺少文件夹", "请选择有效的发票 PDF 文件夹。")
             return
@@ -477,13 +587,23 @@ class InvoiceMatcherGUI:
 
         self.worker_thread = threading.Thread(
             target=self._worker,
-            args=(orders_path, pdf_dir, config_path, output_path, self.recursive_var.get()),
+            args=(
+                orders_path,
+                pdf_dir,
+                config_path,
+                output_path,
+                self.recursive_var.get(),
+                use_preprocessed,
+                list(self.order_rows),
+            ),
             daemon=True,
         )
         self.worker_thread.start()
         self.root.after(100, self._process_queue)
 
-    def _worker(self, orders_path, pdf_dir, config_path, output_path, recursive):
+    def _worker(
+        self, orders_path, pdf_dir, config_path, output_path, recursive, use_preprocessed, order_rows
+    ):
         try:
             self.queue.put(("log", "读取配置文件..."))
             config = matcher.load_config(config_path)
@@ -496,8 +616,12 @@ class InvoiceMatcherGUI:
             self.queue.put(("log", f"PDF 解析后端: {backend}"))
 
             self.queue.put(("log", "读取订单数据..."))
-            orders_df = matcher.load_orders(orders_path, config)
-            self.queue.put(("log", f"订单行数: {len(orders_df)}"))
+            if use_preprocessed and order_rows:
+                orders_df = matcher.build_orders_df_from_rows(order_rows)
+                self.queue.put(("log", f"使用预处理订单：{len(orders_df)} 条"))
+            else:
+                orders_df = matcher.load_orders(orders_path, config)
+                self.queue.put(("log", f"订单行数: {len(orders_df)}"))
 
             self.queue.put(("log", "扫描发票 PDF..."))
             pdfs = matcher.find_pdfs(pdf_dir, recursive)
@@ -514,7 +638,19 @@ class InvoiceMatcherGUI:
 
             self.queue.put(("log", "计算匹配结果..."))
             matches = matcher.match_orders_invoices(orders_df, invoices, config)
+            status_map = matcher.compute_order_match_statuses(
+                orders_df, invoices, matches, config
+            )
+            orders_df["_match_status"] = orders_df.index.map(
+                lambda idx: status_map.get(idx, {}).get("status", "")
+            )
+            orders_df["_match_reason"] = orders_df.index.map(
+                lambda idx: status_map.get(idx, {}).get("reason", "")
+            )
             matcher.write_output(output_path, orders_df, invoices, matches)
+
+            self.next_row_id = 1
+            order_rows = self._build_order_rows_from_df(orders_df, status_map=status_map)
 
             self.queue.put(
                 (
@@ -525,6 +661,12 @@ class InvoiceMatcherGUI:
                         "matches": len(matches),
                         "output": output_path,
                     },
+                )
+            )
+            self.queue.put(
+                (
+                    "order_rows",
+                    {"rows": order_rows},
                 )
             )
         except matcher.MatchError as exc:
@@ -553,6 +695,9 @@ class InvoiceMatcherGUI:
                 self.status_var.set("完成")
                 if Path(payload["output"]).exists():
                     self.open_output_button.configure(state="normal")
+            elif kind == "order_rows":
+                self.use_preprocessed_orders = True
+                self._set_order_rows(payload.get("rows", []))
             elif kind == "error":
                 self._log(payload)
                 self.status_var.set("出错")
@@ -564,6 +709,179 @@ class InvoiceMatcherGUI:
             self.run_button.configure(state="normal")
             if self.status_var.get() not in ("完成", "出错"):
                 self.status_var.set("就绪")
+
+    def _set_order_rows(self, rows, order_statuses=None):
+        self.order_rows = rows
+        self._update_status_filter_values(order_statuses)
+        self._refresh_order_tree()
+
+    def _update_status_filter_values(self, order_statuses=None):
+        if order_statuses is None:
+            order_statuses = sorted(
+                {row.get("order_status") for row in self.order_rows if row.get("order_status")}
+            )
+        values = ["全部"] + list(order_statuses)
+        self.status_filter_combo.configure(values=values)
+        if self.status_filter_var.get() not in values:
+            self.status_filter_var.set("全部")
+
+    def _apply_order_filter(self):
+        self._refresh_order_tree()
+
+    def _refresh_order_tree(self):
+        if not self.order_tree:
+            return
+        self.order_tree.delete(*self.order_tree.get_children())
+        filter_value = self.status_filter_var.get()
+        for row in self.order_rows:
+            if filter_value and filter_value != "全部":
+                if row.get("order_status") != filter_value:
+                    continue
+            tags = ()
+            color = row.get("color")
+            if color in ("green", "orange", "red"):
+                tags = (color,)
+            self.order_tree.insert(
+                "",
+                "end",
+                iid=str(row.get("row_id", "")),
+                values=(
+                    matcher.format_order_id(row.get("order_id", "")),
+                    row.get("vendor", ""),
+                    row.get("description", ""),
+                    format_amount(row.get("amount")),
+                    row.get("order_status", ""),
+                    row.get("match_status", ""),
+                    row.get("match_reason", ""),
+                ),
+                tags=tags,
+            )
+
+    def _parse_orders(self):
+        orders_path = self.orders_var.get().strip()
+        if not orders_path or not Path(orders_path).exists():
+            messagebox.showerror("缺少文件", "请先选择订单文件。")
+            return
+        config_path = self.config_var.get().strip()
+        try:
+            config = matcher.load_config(config_path)
+            orders_df = matcher.load_orders(orders_path, config)
+        except matcher.MatchError as exc:
+            messagebox.showerror("解析失败", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("解析失败", f"无法解析订单：{exc}")
+            return
+
+        self.next_row_id = 1
+        rows = self._build_order_rows_from_df(orders_df)
+        self.use_preprocessed_orders = True
+        self._set_order_rows(rows)
+        messagebox.showinfo("解析完成", f"已解析 {len(rows)} 条订单。")
+
+    def _build_order_rows_from_df(self, orders_df, status_map=None):
+        rows = []
+        for order_idx, row in orders_df.iterrows():
+            status_info = status_map.get(order_idx, {}) if status_map else {}
+            rows.append(
+                {
+                    "row_id": self._next_row_id(),
+                    "order_id": matcher.format_order_id(row.get("_order_id", "")),
+                    "vendor": row.get("_vendor", ""),
+                    "description": row.get("_description", ""),
+                    "amount": row.get("_amount", None),
+                    "order_status": row.get("_status", ""),
+                    "order_date": row.get("_date", None),
+                    "match_status": status_info.get("status", ""),
+                    "match_reason": status_info.get("reason", ""),
+                    "color": status_info.get("color", ""),
+                }
+            )
+        return rows
+
+    def _next_row_id(self):
+        row_id = self.next_row_id
+        self.next_row_id += 1
+        return row_id
+
+    def _delete_selected_orders(self):
+        if not self.order_tree:
+            return
+        selected = self.order_tree.selection()
+        if not selected:
+            messagebox.showinfo("未选择", "请选择要删除的订单。")
+            return
+        selected_ids = {str(item) for item in selected}
+        self.order_rows = [
+            row for row in self.order_rows if str(row.get("row_id", "")) not in selected_ids
+        ]
+        self.use_preprocessed_orders = True
+        self._update_status_filter_values()
+        self._refresh_order_tree()
+
+    def _clear_order_list(self):
+        if not self.order_rows:
+            return
+        should = messagebox.askyesno("清空确认", "确定清空订单列表吗？")
+        if not should:
+            return
+        self.order_rows = []
+        self.use_preprocessed_orders = False
+        self.status_filter_var.set("全部")
+        self._update_status_filter_values([])
+        self._refresh_order_tree()
+
+    def _add_manual_order(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("新增订单")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        fields = {
+            "order_id": ("订单号", tk.StringVar()),
+            "vendor": ("店铺名称", tk.StringVar()),
+            "description": ("明细", tk.StringVar()),
+            "amount": ("实付金额", tk.StringVar()),
+            "order_status": ("订单状态", tk.StringVar()),
+            "order_date": ("订单时间(可选)", tk.StringVar()),
+        }
+
+        for idx, (key, (label, var)) in enumerate(fields.items()):
+            ttk.Label(dialog, text=label).grid(row=idx, column=0, sticky="w", padx=8, pady=6)
+            ttk.Entry(dialog, textvariable=var, width=40).grid(
+                row=idx, column=1, sticky="ew", padx=8, pady=6
+            )
+
+        dialog.columnconfigure(1, weight=1)
+
+        def on_add():
+            amount_text = fields["amount"][1].get().strip()
+            amount_value = matcher.parse_amount(amount_text) if amount_text else None
+            new_row = {
+                "row_id": self._next_row_id(),
+                "order_id": fields["order_id"][1].get().strip(),
+                "vendor": fields["vendor"][1].get().strip(),
+                "description": fields["description"][1].get().strip(),
+                "amount": amount_value if amount_value is not None else amount_text,
+                "order_status": fields["order_status"][1].get().strip(),
+                "order_date": fields["order_date"][1].get().strip(),
+                "match_status": "",
+                "match_reason": "",
+                "color": "",
+            }
+            self.order_rows.append(new_row)
+            self.use_preprocessed_orders = True
+            self._update_status_filter_values()
+            self._refresh_order_tree()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=10)
+        ttk.Button(button_frame, text="添加", command=on_add).pack(side="left", padx=6)
+        ttk.Button(button_frame, text="取消", command=on_cancel).pack(side="left", padx=6)
 
     def _open_output(self):
         output_path = self.output_var.get().strip()

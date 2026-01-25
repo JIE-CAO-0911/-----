@@ -4,7 +4,8 @@
     "amount": "",
     "date": "",
     "vendor": "",
-    "description": ""
+    "description": "",
+    "status": ""
   },
   "invoice_patterns": {
     "invoice_id": [
@@ -31,6 +32,8 @@
       "vendor": 0.2
     },
     "min_score": 0.7,
-    "allow_duplicate_orders": false
+    "allow_duplicate_orders": false,
+    "vendor_similarity_threshold": 0.6,
+    "merge_multi_item_orders": true
   }
 }
