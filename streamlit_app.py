@@ -379,6 +379,10 @@ def describe_invoice(invoice):
     return name
 
 
+def build_order_invoice_map(matches):
+    return {int(item["order_row"]): item for item in matches}
+
+
 def build_suspect_invoice_map(orders_df, invoices, config, matches):
     rules = (config or {}).get("match_rules", {})
     vendor_threshold = float(rules.get("vendor_similarity_threshold", 0.6))
@@ -392,7 +396,7 @@ def build_suspect_invoice_map(orders_df, invoices, config, matches):
             continue
         amount_map.setdefault(key, []).append(invoice)
 
-    match_map = {int(item["order_row"]): item for item in matches}
+    match_map = build_order_invoice_map(matches)
     suspect_map = {}
     for order_idx, order in orders_df.iterrows():
         suspects = []
@@ -569,6 +573,8 @@ def build_match_grid_options(df, color_map):
         filter=True,
     )
     builder.configure_column("_order_row", header_name="ROW", hide=True)
+    if "order_date" in df.columns:
+        builder.configure_column("order_date", header_name="时间", width=120)
     link_formatter, link_class, link_tooltip = build_product_link_helpers()
     if link_formatter:
         builder.configure_column(
@@ -1012,16 +1018,19 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                     "product_link": orders_df.get("_product_link", ""),
                     "amount": orders_df["_amount"],
                     "order_status": orders_df["_status"],
+                    "order_date": orders_df["_date"],
                     "match_status": orders_df["_match_status"],
                     "match_reason": orders_df["_match_reason"],
                 }
             )
+            result_df["order_date"] = result_df["order_date"].apply(format_editor_date)
 
             st.session_state.match_result_df = result_df
             st.session_state.match_detail = {
                 "suspect_map": build_suspect_invoice_map(
                     orders_df, invoices, config, matches
                 ),
+                "order_invoice_map": build_order_invoice_map(matches),
                 "unmatched_invoices": [
                     inv for inv in invoices if inv.get("match_order_row") is None
                 ],
@@ -1113,6 +1122,49 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                 use_container_width=True,
                 height=520,
             )
+
+        matched_orders = view_df[view_df["match_status"] == "完美匹配"].copy()
+
+        if not matched_orders.empty:
+            order_invoice_map = st.session_state.match_detail.get("order_invoice_map", {})
+            matched_orders["invoice_file"] = matched_orders["_order_row"].map(
+                lambda idx: order_invoice_map.get(int(idx), {}).get("invoice_file", "")
+            )
+            matched_orders["invoice_id"] = matched_orders["_order_row"].map(
+                lambda idx: order_invoice_map.get(int(idx), {}).get("invoice_id", "")
+            )
+        export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
+        with export_col1:
+            csv_data = matched_orders.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "导出已匹配订单 CSV",
+                data=csv_data,
+                file_name="已匹配订单.csv",
+                mime="text/csv",
+                disabled=matched_orders.empty,
+            )
+        with export_col2:
+            if matched_orders.empty:
+                st.download_button(
+                    "导出已匹配订单 Excel",
+                    data=b"",
+                    file_name="已匹配订单.xlsx",
+                    disabled=True,
+                )
+            else:
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                    matched_orders.to_excel(
+                        writer, index=False, sheet_name="matched_orders"
+                    )
+                st.download_button(
+                    "导出已匹配订单 Excel",
+                    data=buffer.getvalue(),
+                    file_name="已匹配订单.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        with export_col3:
+            st.caption(f"已匹配 {len(matched_orders)} 行")
 
     if st.session_state.match_result_df is not None:
         detail = st.session_state.get("match_detail", {})
