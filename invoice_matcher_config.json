@@ -5,7 +5,8 @@
     "date": "订单提交时间",
     "vendor": "店铺名称",
     "description": "商品名称",
-    "status": "订单状态"
+    "status": "订单状态",
+    "product_link": "商品链接"
   },
   "invoice_patterns": {
     "invoice_id": [

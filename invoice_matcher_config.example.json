@@ -5,7 +5,8 @@
     "date": "",
     "vendor": "",
     "description": "",
-    "status": ""
+    "status": "",
+    "product_link": ""
   },
   "invoice_patterns": {
     "invoice_id": [

@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
         "vendor": "",
         "description": "",
         "status": "",
+        "product_link": "",
     },
     "invoice_patterns": {
         "invoice_id": [
@@ -55,6 +56,21 @@ ORDER_CANDIDATES = {
     "vendor": {"vendor", "merchant", "seller", "supplier", "company"},
     "description": {"description", "item", "details", "notes"},
     "status": {"status", "orderstatus", "order_state", "state"},
+    "product_link": {
+        "link",
+        "url",
+        "productlink",
+        "product_link",
+        "itemlink",
+        "item_link",
+        "商品链接",
+        "商品链接地址",
+        "商品网址",
+        "商品地址",
+        "商品url",
+        "商品URL",
+        "链接",
+    },
 }
 
 MODEL_CANDIDATES = {"型号款式", "型号", "规格", "规格型号"}
@@ -422,6 +438,9 @@ def load_orders(orders_path, config):
     desc_col = pick_column(
         columns, order_cols.get("description"), ORDER_CANDIDATES["description"]
     )
+    link_col = pick_column(
+        columns, order_cols.get("product_link"), ORDER_CANDIDATES["product_link"]
+    )
     status_col = pick_column(
         columns, order_cols.get("status"), ORDER_CANDIDATES["status"]
     )
@@ -436,6 +455,9 @@ def load_orders(orders_path, config):
     )
     df["_description"] = (
         df[desc_col].apply(normalize_text) if desc_col else ""
+    )
+    df["_product_link"] = (
+        df[link_col].apply(normalize_text) if link_col else ""
     )
     df["_status"] = (
         df[status_col].apply(normalize_text) if status_col else ""
@@ -538,6 +560,7 @@ def merge_multi_item_orders(df, config):
             "_date": first_not_null,
             "_vendor": first_non_empty,
             "_description": merge_lines,
+            "_product_link": first_non_empty,
             "_status": first_non_empty,
             "_line_item": merge_lines,
         }
@@ -558,7 +581,17 @@ def build_orders_df_from_rows(rows):
 
     df = pd.DataFrame(rows)
     if df.empty:
-        df = pd.DataFrame(columns=["order_id", "vendor", "description", "amount", "order_status"])
+        df = pd.DataFrame(
+            columns=[
+                "order_id",
+                "vendor",
+                "description",
+                "product_link",
+                "amount",
+                "order_status",
+                "order_date",
+            ]
+        )
 
     def col_or_empty(name):
         if name in df.columns:
@@ -569,6 +602,7 @@ def build_orders_df_from_rows(rows):
     df["_vendor"] = col_or_empty("vendor").apply(normalize_text)
     df["_description"] = col_or_empty("description").apply(normalize_text)
     df["_amount"] = col_or_empty("amount").apply(parse_amount)
+    df["_product_link"] = col_or_empty("product_link").apply(normalize_text)
 
     if "order_status" in df.columns:
         df["_status"] = df["order_status"].apply(normalize_text)
