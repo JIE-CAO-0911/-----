@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 import invoice_matcher as matcher
+import screenshot_manager as shots
 
 try:
     import streamlit.runtime.runtime as st_runtime
@@ -76,6 +77,34 @@ GRID_CUSTOM_CSS = {
         "color": "#888888",
         "text-align": "center",
     },
+    ".ag-row.ag-row-selected": {
+        "outline": "2px solid #f59e0b",
+        "outline-offset": "-2px",
+    },
+    ".ag-cell.screenshot-status-none": {
+        "background-color": "#fee2e2",
+        "color": "#991b1b",
+        "border-radius": "4px",
+        "text-align": "center",
+        "cursor": "pointer",
+        "font-weight": "600",
+    },
+    ".ag-cell.screenshot-status-partial": {
+        "background-color": "#ffedd5",
+        "color": "#9a3412",
+        "border-radius": "4px",
+        "text-align": "center",
+        "cursor": "pointer",
+        "font-weight": "600",
+    },
+    ".ag-cell.screenshot-status-full": {
+        "background-color": "#dcfce7",
+        "color": "#166534",
+        "border-radius": "4px",
+        "text-align": "center",
+        "cursor": "pointer",
+        "font-weight": "600",
+    },
 }
 EDITOR_COLUMNS = [
     "order_id",
@@ -128,6 +157,7 @@ def ensure_session_state():
                 "order_date",
             ]
         )
+    shots.init_session_state()
     if "order_row_id_seq" not in st.session_state:
         st.session_state.order_row_id_seq = 1
     if "order_grid_version" not in st.session_state:
@@ -330,6 +360,100 @@ def merge_grid_updates(full_df, updated_df):
     return merged
 
 
+def add_screenshot_status_column(df, order_id_field, row_id_field):
+    display_df = df.copy()
+    if "screenshot_status" in display_df.columns:
+        display_df = display_df.drop(columns=["screenshot_status"])
+    statuses = []
+    for _, row in display_df.iterrows():
+        order_key = shots.build_order_key(row.get(order_id_field), row.get(row_id_field))
+        statuses.append(shots.get_status_label(order_key))
+    display_df.insert(0, "screenshot_status", statuses)
+    return display_df
+
+
+def add_auto_unique_id_column(df, column_name="auto_unique_id", position=1):
+    display_df = df.copy()
+    if column_name in display_df.columns:
+        display_df = display_df.drop(columns=[column_name])
+    if "screenshot_status" in display_df.columns:
+        insert_at = display_df.columns.get_loc("screenshot_status") + 1
+    elif "order_id" in display_df.columns:
+        insert_at = display_df.columns.get_loc("order_id") + 1
+    else:
+        insert_at = position
+    insert_at = max(0, min(insert_at, len(display_df.columns)))
+    display_df.insert(insert_at, column_name, range(1, len(display_df) + 1))
+    return display_df
+
+
+def add_focus_row_column(df, row_id_field, selected_row_id):
+    display_df = df.copy()
+    if "_focus_row" in display_df.columns:
+        display_df = display_df.drop(columns=["_focus_row"])
+    if row_id_field not in display_df.columns:
+        display_df["_focus_row"] = False
+        return display_df
+    if selected_row_id is None or selected_row_id == "":
+        display_df["_focus_row"] = False
+        return display_df
+    try:
+        target = str(int(selected_row_id))
+    except Exception:
+        target = str(selected_row_id)
+    display_df["_focus_row"] = display_df[row_id_field].astype(str) == target
+    return display_df
+
+
+def resolve_selected_row(selected_rows, display_df, row_id_field, state_key):
+    lock_key = f"{state_key}_lock"
+    saved = st.session_state.get(state_key)
+    if st.session_state.get(lock_key) and saved is not None and not display_df.empty:
+        match = display_df[display_df[row_id_field] == saved]
+        if not match.empty:
+            if (
+                selected_rows
+                and row_id_field in selected_rows[0]
+                and selected_rows[0][row_id_field] == saved
+            ):
+                st.session_state[lock_key] = False
+                return selected_rows[0]
+            return match.iloc[0].to_dict()
+    if selected_rows:
+        selected = selected_rows[0]
+        if row_id_field in selected:
+            value = selected[row_id_field]
+            try:
+                value = int(value)
+            except Exception:
+                pass
+            st.session_state[state_key] = value
+        st.session_state[lock_key] = False
+        return selected
+    if saved is not None and not display_df.empty:
+        match = display_df[display_df[row_id_field] == saved]
+        if not match.empty:
+            return match.iloc[0].to_dict()
+    return None
+
+
+def make_step_order_callback(row_ids, state_key, step):
+    def _step_order():
+        if not row_ids:
+            return
+        current = st.session_state.get(state_key)
+        if current in row_ids:
+            idx = row_ids.index(current)
+            next_id = row_ids[(idx + step) % len(row_ids)]
+        else:
+            next_id = row_ids[0]
+        st.session_state[state_key] = next_id
+        st.session_state[f"{state_key}_lock"] = True
+        trigger_rerun()
+
+    return _step_order
+
+
 def sum_amounts(values):
     total = 0.0
     for value in values:
@@ -461,7 +585,7 @@ def start_auto_shutdown_monitor():
     thread.start()
 
 
-def build_order_grid_options(df, editable):
+def build_order_grid_options(df, editable, selected_row_id=None, row_id_field=None):
     builder = GridOptionsBuilder.from_dataframe(df)
     builder.configure_default_column(
         editable=editable,
@@ -469,6 +593,21 @@ def build_order_grid_options(df, editable):
         sortable=True,
         filter=True,
     )
+    if "_focus_row" in df.columns:
+        builder.configure_column("_focus_row", hide=True, editable=False)
+    if "auto_unique_id" in df.columns:
+        builder.configure_column(
+            "auto_unique_id", header_name="auto_unique_id", width=90, editable=False
+        )
+    if "screenshot_status" in df.columns:
+        status_style = build_screenshot_status_style()
+        builder.configure_column(
+            "screenshot_status",
+            header_name="截图状态",
+            width=120,
+            editable=False,
+            cellStyle=status_style,
+        )
     builder.configure_column("order_id", header_name="订单号", width=140)
     builder.configure_column("vendor", header_name="店铺", width=160)
     builder.configure_column("description", header_name="明细", width=260)
@@ -499,7 +638,11 @@ def build_order_grid_options(df, editable):
     )
     builder.configure_column("order_date", header_name="时间", width=120)
     builder.configure_column("_row_id", header_name="ID", hide=True, editable=False)
-    builder.configure_selection("multiple", use_checkbox=True)
+    if "order_row" in df.columns:
+        builder.configure_column("order_row", hide=True, editable=False)
+    if "_order_row" in df.columns:
+        builder.configure_column("_order_row", hide=True, editable=False)
+    builder.configure_selection("single", use_checkbox=False)
     builder.configure_grid_options(
         rowHeight=32,
         stopEditingWhenCellsLoseFocus=True,
@@ -507,6 +650,9 @@ def build_order_grid_options(df, editable):
     link_click = build_product_link_click_handler()
     if link_click:
         builder.configure_grid_options(onCellClicked=link_click)
+    focus_opts = build_row_focus_options(row_id_field, selected_row_id)
+    if focus_opts:
+        builder.configure_grid_options(**focus_opts)
     return builder.build()
 
 
@@ -564,7 +710,79 @@ def build_product_link_click_handler():
         return None
 
 
-def build_match_grid_options(df, color_map):
+def build_screenshot_status_style():
+    if not JS_CODE_AVAILABLE or JsCode is None:
+        return None
+    try:
+        return JsCode(
+            """
+            function(params) {
+                if (params.value === '无截图') {
+                    return {backgroundColor:'#fee2e2', color:'#991b1b', fontWeight:'600',
+                            textAlign:'center', cursor:'pointer', borderRadius:'4px'};
+                }
+                if (params.value === '截图不完全') {
+                    return {backgroundColor:'#ffedd5', color:'#9a3412', fontWeight:'600',
+                            textAlign:'center', cursor:'pointer', borderRadius:'4px'};
+                }
+                if (params.value === '有截图') {
+                    return {backgroundColor:'#dcfce7', color:'#166534', fontWeight:'600',
+                            textAlign:'center', cursor:'pointer', borderRadius:'4px'};
+                }
+                return {};
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+def build_row_focus_options(row_id_field, selected_row_id):
+    if not JS_CODE_AVAILABLE or JsCode is None or not row_id_field:
+        return {}
+
+    def_js = {}
+    selected_value = None
+    if selected_row_id not in (None, ""):
+        selected_value = str(selected_row_id)
+    def_js["getRowId"] = JsCode(
+        f"function(params) {{ return String(params.data.{row_id_field}); }}"
+    )
+    def_js["context"] = {"selectedRowId": selected_value}
+    focus_js = JsCode(
+        f"""
+        function(params) {{
+            const ctx = params.context || {{}};
+            const target = ctx.selectedRowId;
+            if (target === undefined || target === null || target === '') {{
+                return;
+            }}
+            const targetStr = String(target);
+            const node = params.api.getRowNode(targetStr);
+            if (node) {{
+                node.setSelected(true);
+                params.api.ensureNodeVisible(node, 'middle');
+                return;
+            }}
+            const count = params.api.getDisplayedRowCount();
+            for (let i = 0; i < count; i++) {{
+                const rowNode = params.api.getDisplayedRowAtIndex(i);
+                if (rowNode && rowNode.data && String(rowNode.data.{row_id_field}) === targetStr) {{
+                    rowNode.setSelected(true);
+                    params.api.ensureIndexVisible(i, 'middle');
+                    break;
+                }}
+            }}
+        }}
+        """
+    )
+    def_js["onFirstDataRendered"] = focus_js
+    def_js["onGridReady"] = focus_js
+    def_js["onRowDataUpdated"] = focus_js
+    return def_js
+
+
+def build_match_grid_options(df, color_map, selected_row_id=None, row_id_field=None):
     builder = GridOptionsBuilder.from_dataframe(df)
     builder.configure_default_column(
         editable=False,
@@ -573,6 +791,23 @@ def build_match_grid_options(df, color_map):
         filter=True,
     )
     builder.configure_column("_order_row", header_name="ROW", hide=True)
+    if "order_row" in df.columns:
+        builder.configure_column("order_row", hide=True, editable=False)
+    if "_focus_row" in df.columns:
+        builder.configure_column("_focus_row", hide=True, editable=False)
+    if "auto_unique_id" in df.columns:
+        builder.configure_column(
+            "auto_unique_id", header_name="auto_unique_id", width=90, editable=False
+        )
+    if "screenshot_status" in df.columns:
+        status_style = build_screenshot_status_style()
+        builder.configure_column(
+            "screenshot_status",
+            header_name="截图状态",
+            width=120,
+            editable=False,
+            cellStyle=status_style,
+        )
     if "order_date" in df.columns:
         builder.configure_column("order_date", header_name="时间", width=120)
     link_formatter, link_class, link_tooltip = build_product_link_helpers()
@@ -613,6 +848,9 @@ def build_match_grid_options(df, color_map):
     link_click = build_product_link_click_handler()
     if link_click:
         builder.configure_grid_options(onCellClicked=link_click)
+    focus_opts = build_row_focus_options(row_id_field, selected_row_id)
+    if focus_opts:
+        builder.configure_grid_options(**focus_opts)
     return builder.build()
 
 
@@ -760,7 +998,7 @@ def render_preprocess_tab(orders_paths, config_path):
         allow_edit = st.checkbox("允许编辑", value=False)
 
     if allow_edit:
-        st.caption("双击单元格编辑，勾选行后点击“删除选中”。")
+        st.caption("双击单元格编辑，点击行后可删除当前行。")
     else:
         st.caption("当前为只读模式，如需修改请勾选“允许编辑”。")
 
@@ -787,18 +1025,24 @@ def render_preprocess_tab(orders_paths, config_path):
         selected_statuses = []
 
     if status_options and selected_statuses:
-        display_df = current_df[current_df["order_status"].isin(selected_statuses)]
+        display_base_df = current_df[current_df["order_status"].isin(selected_statuses)]
     elif status_options and not selected_statuses:
-        display_df = current_df.iloc[0:0]
+        display_base_df = current_df.iloc[0:0]
     else:
-        display_df = current_df
+        display_base_df = current_df
+
+    selected_row_id = st.session_state.get("preprocess_selected_row_id")
+    display_df = add_auto_unique_id_column(display_base_df)
 
     grid_key = f"order_grid_{st.session_state.order_grid_version}"
     grid_response = AgGrid(
         display_df,
-        gridOptions=build_order_grid_options(display_df, allow_edit),
+        gridOptions=build_order_grid_options(
+            display_df, allow_edit, selected_row_id, "_row_id"
+        ),
         data_return_mode=DataReturnMode.AS_INPUT,
         update_mode=GridUpdateMode.MODEL_CHANGED,
+        update_on=["cellValueChanged", "selectionChanged"],
         fit_columns_on_grid_load=True,
         theme="balham",
         key=grid_key,
@@ -812,27 +1056,30 @@ def render_preprocess_tab(orders_paths, config_path):
             updated_df = pd.DataFrame(updated_data)
         else:
             updated_df = updated_data
-        updated_df = ensure_editor_df(updated_df)
-        if not updated_df.equals(display_df):
+        updated_clean = ensure_editor_df(updated_df)
+        if not updated_clean.equals(display_base_df):
             st.session_state.match_result_df = None
             st.session_state.match_detail = {}
-        if display_df.shape[0] != current_df.shape[0]:
-            st.session_state.order_df = merge_grid_updates(current_df, updated_df)
+        if display_base_df.shape[0] != current_df.shape[0]:
+            st.session_state.order_df = merge_grid_updates(current_df, updated_clean)
         else:
-            st.session_state.order_df = updated_df
+            st.session_state.order_df = updated_clean
 
     selected_rows = grid_response.get("selected_rows")
     if selected_rows is None:
         selected_rows = []
     elif isinstance(selected_rows, pd.DataFrame):
         selected_rows = selected_rows.to_dict("records")
-    selected_ids = {
-        int(row["_row_id"])
-        for row in selected_rows
-        if row and row.get("_row_id") is not None
-    }
+    selected_row = resolve_selected_row(
+        selected_rows, display_df, "_row_id", "preprocess_selected_row_id"
+    )
+    selected_ids = (
+        {int(selected_row["_row_id"])}
+        if selected_row and selected_row.get("_row_id") is not None
+        else set()
+    )
 
-    action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 2])
+    action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
     with action_col1:
         if st.button("新增空行"):
             new_row = {
@@ -853,9 +1100,9 @@ def render_preprocess_tab(orders_paths, config_path):
             set_order_df(new_df, notice="已新增空行", reset_grid=True)
             trigger_rerun()
     with action_col2:
-        if st.button("删除选中"):
+        if st.button("删除当前"):
             if not selected_ids:
-                st.warning("未选择行")
+                st.warning("请先点击一行")
             else:
                 new_df = st.session_state.order_df[
                     ~st.session_state.order_df["_row_id"].isin(selected_ids)
@@ -871,9 +1118,6 @@ def render_preprocess_tab(orders_paths, config_path):
             empty_df = pd.DataFrame(columns=EDITOR_COLUMNS)
             set_order_df(empty_df, notice="已清空", reset_grid=True, reset_row_ids=True)
             trigger_rerun()
-    with action_col4:
-        st.caption(f"已选 {len(selected_ids)} 行")
-
     export_config = load_config(config_path)
     export_df = build_export_df_with_config(st.session_state.order_df, export_config)
     export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
@@ -1078,11 +1322,15 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
         view_df = st.session_state.match_result_df.copy()
         if status_filter != "全部":
             view_df = view_df[view_df["order_status"] == status_filter]
+        view_df = add_auto_unique_id_column(view_df)
 
         if AGGRID_AVAILABLE:
+            selected_row_id = st.session_state.get("match_selected_row_id")
             grid_response = AgGrid(
                 view_df,
-                gridOptions=build_match_grid_options(view_df, color_map),
+                gridOptions=build_match_grid_options(
+                    view_df, color_map, selected_row_id, "_order_row"
+                ),
                 data_return_mode=DataReturnMode.AS_INPUT,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 fit_columns_on_grid_load=True,
@@ -1098,8 +1346,10 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
             elif isinstance(selected_rows, pd.DataFrame):
                 selected_rows = selected_rows.to_dict("records")
 
-            if selected_rows:
-                selected = selected_rows[0]
+            selected = resolve_selected_row(
+                selected_rows, view_df, "_order_row", "match_selected_row_id"
+            )
+            if selected:
                 if selected.get("match_status") == "疑似匹配":
                     detail = st.session_state.get("match_detail", {})
                     suspect_map = detail.get("suspect_map", {})
@@ -1116,6 +1366,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                                     key=f"suspect_open_{order_row}_{idx}",
                                 ):
                                     open_pdf_file(invoice.get("invoice_file", ""))
+
         else:
             st.dataframe(
                 view_df.style.apply(lambda r: style_match_rows(r, color_map), axis=1),
@@ -1177,6 +1428,96 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                         open_pdf_file(invoice.get("invoice_file", ""))
 
 
+def load_matched_orders_file(uploaded_file):
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    return pd.read_excel(uploaded_file)
+
+
+def prepare_screenshot_orders_df(df):
+    df = df.copy()
+    defaults = {
+        "order_id": "",
+        "vendor": "",
+        "description": "",
+        "product_link": "",
+        "amount": "",
+        "order_status": "",
+        "order_date": "",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    if "_row_id" not in df.columns:
+        df["_row_id"] = range(1, len(df) + 1)
+    df["order_date"] = df["order_date"].apply(format_editor_date)
+    return df
+
+
+def render_screenshot_tab():
+    st.subheader("截图管理")
+    if not AGGRID_AVAILABLE:
+        st.error("未安装可编辑表格组件：streamlit-aggrid")
+        st.caption("安装命令：pip install streamlit-aggrid")
+        return
+    uploaded = st.file_uploader("导入已匹配订单文件", type=["xlsx", "csv"])
+    if not uploaded:
+        st.caption("请上传已匹配订单文件（由匹配页导出）。")
+        return
+
+    try:
+        df = load_matched_orders_file(uploaded)
+    except Exception as exc:
+        st.error(f"导入失败：{exc}")
+        return
+
+    df = prepare_screenshot_orders_df(df)
+    st.caption(f"已导入 {len(df)} 行")
+    st.caption("点击“截图状态”可进入截图管理。")
+    display_df = add_screenshot_status_column(df, "order_id", "_row_id")
+    display_df = add_auto_unique_id_column(display_df)
+
+    selected_row_id = st.session_state.get("screenshot_selected_row_id")
+    display_df = add_focus_row_column(display_df, "_row_id", selected_row_id)
+    grid_response = AgGrid(
+        display_df,
+        gridOptions=build_order_grid_options(display_df, editable=False, selected_row_id=selected_row_id, row_id_field="_row_id"),
+        data_return_mode=DataReturnMode.AS_INPUT,
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        fit_columns_on_grid_load=True,
+        theme="balham",
+        key="screenshot_orders_grid",
+        height=520,
+        allow_unsafe_jscode=True,
+        custom_css=GRID_CUSTOM_CSS,
+    )
+
+    selected_rows = grid_response.get("selected_rows")
+    if selected_rows is None:
+        selected_rows = []
+    elif isinstance(selected_rows, pd.DataFrame):
+        selected_rows = selected_rows.to_dict("records")
+
+    selected = resolve_selected_row(
+        selected_rows, display_df, "_row_id", "screenshot_selected_row_id"
+    )
+
+    with st.expander("截图管理", expanded=selected is not None):
+        if not selected:
+            st.info("请先在表格中点击一条订单的“截图状态”。")
+        else:
+            order_id = selected.get("order_id", "")
+            order_key = shots.build_order_key(order_id, selected.get("_row_id"))
+            label = f"订单号：{order_id}" if order_id else f"订单行：{selected.get('_row_id')}"
+            row_ids = display_df["_row_id"].tolist()
+            next_action = make_step_order_callback(row_ids, "screenshot_selected_row_id", 1)
+            prev_action = make_step_order_callback(row_ids, "screenshot_selected_row_id", -1)
+            shots.render_screenshot_manager(
+                order_key, label, on_next_order=next_action, on_prev_order=prev_action
+            )
+
+
 def main():
     st.set_page_config(page_title="发票匹配", layout="wide")
     ensure_session_state()
@@ -1227,7 +1568,7 @@ def main():
     config_path = st.session_state.config_path
     output_path = st.session_state.output_path
 
-    tab1, tab2, tab3 = st.tabs(["预处理", "匹配", "配置"])
+    tab1, tab2, tab3, tab4 = st.tabs(["预处理", "匹配", "配置", "截图"])
     color_map = {
         "完美匹配": st.session_state.color_perfect,
         "疑似匹配": st.session_state.color_suspect,
@@ -1247,6 +1588,8 @@ def main():
         )
     with tab3:
         render_config_tab(config_path)
+    with tab4:
+        render_screenshot_tab()
 
 
 if __name__ == "__main__":
