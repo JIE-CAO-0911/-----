@@ -3,10 +3,13 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
 
@@ -15,6 +18,14 @@ import streamlit as st
 
 import invoice_matcher as matcher
 import screenshot_manager as shots
+
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    PIL_AVAILABLE = False
 
 try:
     import streamlit.runtime.runtime as st_runtime
@@ -898,6 +909,257 @@ def select_export_path(default_name):
     return path or None
 
 
+def select_export_directory(title):
+    if not TK_AVAILABLE:
+        st.warning("无法打开目录选择窗口，请检查 Tk 环境。")
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askdirectory(title=title)
+    root.destroy()
+    return path or None
+
+
+def sanitize_filename(value, default="未命名"):
+    text = str(value or "").strip()
+    if text.lower() in {"nan", "none"}:
+        text = ""
+    if not text:
+        text = default
+    text = re.sub(r'[<>:"/\\\\|?*]', "_", text)
+    text = text.replace("\n", " ").replace("\r", " ")
+    return text.strip() or default
+
+
+def parse_amount_value(value):
+    amount = matcher.parse_amount(value)
+    if amount is not None:
+        return float(amount)
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def build_export_basename(total_amount):
+    try:
+        amount_value = float(total_amount)
+    except Exception:
+        amount_value = 0.0
+    amount_text = f"{amount_value:.2f}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"报销明细{amount_text}+{timestamp}", timestamp, amount_text
+
+
+def build_print_basename(total_amount):
+    try:
+        amount_value = float(total_amount)
+    except Exception:
+        amount_value = 0.0
+    amount_text = f"{amount_value:.2f}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"报销明细打印 {amount_text} {timestamp}", timestamp, amount_text
+
+
+def build_reimbursement_details_df(df):
+    base_cols = [
+        "order_id",
+        "vendor",
+        "description",
+        "product_link",
+        "amount",
+        "order_status",
+        "order_date",
+        "invoice_id",
+        "invoice_file",
+    ]
+    cols = [col for col in base_cols if col in df.columns]
+    details_df = df[cols].copy() if cols else df.copy()
+    order_counts = []
+    payment_counts = []
+    store = st.session_state.get("screenshot_store", {})
+    for idx, row in df.iterrows():
+        fallback_id = row.get("_row_id", idx)
+        order_key = shots.build_order_key(row.get("order_id"), fallback_id)
+        entry = store.get(order_key, {})
+        order_counts.append(len(entry.get(shots.CATEGORY_ORDER, [])))
+        payment_counts.append(len(entry.get(shots.CATEGORY_PAYMENT, [])))
+    details_df["订单截图数"] = order_counts
+    details_df["支付截图数"] = payment_counts
+    return details_df
+
+
+def export_reimbursement_bundle(df, export_dir):
+    total_amount = sum_amounts(df.get("amount", []))
+    base_name, timestamp, amount_text = build_export_basename(total_amount)
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    missing_invoices = []
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root_dir = Path(temp_dir) / base_name
+        root_dir.mkdir(parents=True, exist_ok=True)
+
+        details_df = build_reimbursement_details_df(df)
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "订单数": len(df),
+                    "总金额": format_amount(total_amount),
+                    "导出时间": timestamp,
+                }
+            ]
+        )
+        excel_path = root_dir / f"{base_name}.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            details_df.to_excel(writer, index=False, sheet_name="details")
+            summary_df.to_excel(writer, index=False, sheet_name="summary")
+
+        store = st.session_state.get("screenshot_store", {})
+        folder_counts = {}
+        for idx, row in df.iterrows():
+            amount_value = parse_amount_value(row.get("amount"))
+            amount_name = f"{amount_value:.2f}" if amount_value is not None else "0.00"
+            vendor_name = sanitize_filename(row.get("vendor"), default="未知店名")
+            base_folder = f"{amount_name}+{vendor_name}"
+            suffix = folder_counts.get(base_folder, 0)
+            folder_counts[base_folder] = suffix + 1
+            folder_name = (
+                f"{base_folder}_{suffix + 1}" if suffix else base_folder
+            )
+            order_dir = root_dir / folder_name
+            order_dir.mkdir(parents=True, exist_ok=True)
+
+            invoice_path = row.get("invoice_file")
+            if invoice_path is not None:
+                try:
+                    if pd.isna(invoice_path):
+                        invoice_path = None
+                except Exception:
+                    pass
+            if invoice_path:
+                invoice_path = Path(str(invoice_path))
+                if invoice_path.exists():
+                    shutil.copy2(invoice_path, order_dir / invoice_path.name)
+                else:
+                    missing_invoices.append(str(invoice_path))
+
+            fallback_id = row.get("_row_id", idx)
+            order_key = shots.build_order_key(row.get("order_id"), fallback_id)
+            entry = store.get(order_key, {})
+            for i, img_bytes in enumerate(entry.get(shots.CATEGORY_ORDER, []), 1):
+                (order_dir / f"订单截图_{i}.png").write_bytes(img_bytes)
+            for i, img_bytes in enumerate(entry.get(shots.CATEGORY_PAYMENT, []), 1):
+                (order_dir / f"支付截图_{i}.png").write_bytes(img_bytes)
+
+        zip_path = export_dir / f"{base_name}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in root_dir.rglob("*"):
+                arcname = path.relative_to(root_dir.parent)
+                zf.write(path, arcname)
+
+    return zip_path, missing_invoices
+
+
+def get_pdf_backend():
+    try:
+        from pypdf import PdfReader, PdfWriter
+
+        return PdfReader, PdfWriter
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader, PdfWriter
+
+            return PdfReader, PdfWriter
+        except Exception:
+            return None, None
+
+
+def append_pdf_file(writer, reader_cls, path):
+    reader = reader_cls(str(path))
+    for page in reader.pages:
+        writer.add_page(page)
+
+
+def append_image_bytes(writer, reader_cls, img_bytes):
+    if not PIL_AVAILABLE or Image is None:
+        raise RuntimeError("缺少图片处理依赖，请安装 Pillow")
+    image = Image.open(io.BytesIO(img_bytes))
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PDF")
+    buffer.seek(0)
+    reader = reader_cls(buffer)
+    for page in reader.pages:
+        writer.add_page(page)
+
+
+def export_reimbursement_print_pdf(df, export_dir):
+    total_amount = sum_amounts(df.get("amount", []))
+    base_name, timestamp, amount_text = build_print_basename(total_amount)
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    reader_cls, writer_cls = get_pdf_backend()
+    if reader_cls is None:
+        raise RuntimeError("缺少 PDF 合并依赖，请安装 pypdf 或 PyPDF2")
+
+    writer = writer_cls()
+    store = st.session_state.get("screenshot_store", {})
+    missing_invoices = []
+    image_errors = 0
+    added_pages = 0
+
+    for idx, row in df.iterrows():
+        invoice_path = row.get("invoice_file")
+        if invoice_path is not None:
+            try:
+                if pd.isna(invoice_path):
+                    invoice_path = None
+            except Exception:
+                pass
+        if invoice_path:
+            invoice_path = Path(str(invoice_path))
+            if invoice_path.exists():
+                try:
+                    before = len(writer.pages)
+                    append_pdf_file(writer, reader_cls, invoice_path)
+                    added_pages += len(writer.pages) - before
+                except Exception:
+                    missing_invoices.append(str(invoice_path))
+            else:
+                missing_invoices.append(str(invoice_path))
+
+        fallback_id = row.get("_row_id", idx)
+        order_key = shots.build_order_key(row.get("order_id"), fallback_id)
+        entry = store.get(order_key, {})
+        for img_bytes in entry.get(shots.CATEGORY_ORDER, []):
+            try:
+                before = len(writer.pages)
+                append_image_bytes(writer, reader_cls, img_bytes)
+                added_pages += len(writer.pages) - before
+            except Exception:
+                image_errors += 1
+        for img_bytes in entry.get(shots.CATEGORY_PAYMENT, []):
+            try:
+                before = len(writer.pages)
+                append_image_bytes(writer, reader_cls, img_bytes)
+                added_pages += len(writer.pages) - before
+            except Exception:
+                image_errors += 1
+
+    if added_pages == 0:
+        raise RuntimeError("没有可导出的内容")
+
+    pdf_path = export_dir / f"{base_name}.pdf"
+    with open(pdf_path, "wb") as fh:
+        writer.write(fh)
+
+    return pdf_path, missing_invoices, image_errors
+
+
 def render_config_tab(config_path):
     config = load_config(config_path)
 
@@ -1516,6 +1778,37 @@ def render_screenshot_tab():
             shots.render_screenshot_manager(
                 order_key, label, on_next_order=next_action, on_prev_order=prev_action
             )
+
+    st.subheader("导出")
+    export_col1, export_col2, export_col3 = st.columns([1, 1, 3])
+    with export_col1:
+        if st.button("全部导出"):
+            export_dir = select_export_directory("选择导出目录")
+            if export_dir:
+                try:
+                    zip_path, missing = export_reimbursement_bundle(df, export_dir)
+                    st.success(f"已导出：{zip_path}")
+                    if missing:
+                        st.warning(f"未找到发票文件：{len(missing)} 个")
+                except Exception as exc:
+                    st.error(f"导出失败：{exc}")
+    with export_col2:
+        if st.button("打印导出"):
+            export_dir = select_export_directory("选择导出目录")
+            if export_dir:
+                try:
+                    pdf_path, missing, image_errors = export_reimbursement_print_pdf(
+                        df, export_dir
+                    )
+                    st.success(f"已导出：{pdf_path}")
+                    if missing:
+                        st.warning(f"未找到发票文件：{len(missing)} 个")
+                    if image_errors:
+                        st.warning(f"有 {image_errors} 张截图无法合并")
+                except Exception as exc:
+                    st.error(f"导出失败：{exc}")
+    with export_col3:
+        st.caption("压缩包与打印 PDF 的名称都包含总金额与当前时间。")
 
 
 def main():
