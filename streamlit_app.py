@@ -197,6 +197,12 @@ def ensure_session_state():
         st.session_state.color_nomatch = "#ffd6d6"
     if "preprocess_notice" not in st.session_state:
         st.session_state.preprocess_notice = ""
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = "预处理"
+    if "screenshot_prefill_df" not in st.session_state:
+        st.session_state.screenshot_prefill_df = None
+    if "pending_tab" not in st.session_state:
+        st.session_state.pending_tab = None
 
 
 def orders_df_for_editor(orders_df):
@@ -398,10 +404,12 @@ def add_auto_unique_id_column(df, column_name="auto_unique_id", position=1):
     return display_df
 
 
-def add_focus_row_column(df, row_id_field, selected_row_id):
+def add_focus_row_column(df, row_id_field, selected_row_id, force_focus=False):
     display_df = df.copy()
     if "_focus_row" in display_df.columns:
         display_df = display_df.drop(columns=["_focus_row"])
+    if not force_focus:
+        return display_df
     if row_id_field not in display_df.columns:
         display_df["_focus_row"] = False
         return display_df
@@ -596,7 +604,16 @@ def start_auto_shutdown_monitor():
     thread.start()
 
 
-def build_order_grid_options(df, editable, selected_row_id=None, row_id_field=None):
+def build_order_grid_options(
+    df,
+    editable,
+    selected_row_id=None,
+    row_id_field=None,
+    force_focus=False,
+    selection_mode="single",
+    use_checkbox=False,
+    header_checkbox=False,
+):
     builder = GridOptionsBuilder.from_dataframe(df)
     builder.configure_default_column(
         editable=editable,
@@ -653,7 +670,11 @@ def build_order_grid_options(df, editable, selected_row_id=None, row_id_field=No
         builder.configure_column("order_row", hide=True, editable=False)
     if "_order_row" in df.columns:
         builder.configure_column("_order_row", hide=True, editable=False)
-    builder.configure_selection("single", use_checkbox=False)
+    builder.configure_selection(
+        selection_mode,
+        use_checkbox=use_checkbox,
+        header_checkbox=header_checkbox,
+    )
     builder.configure_grid_options(
         rowHeight=32,
         stopEditingWhenCellsLoseFocus=True,
@@ -661,7 +682,7 @@ def build_order_grid_options(df, editable, selected_row_id=None, row_id_field=No
     link_click = build_product_link_click_handler()
     if link_click:
         builder.configure_grid_options(onCellClicked=link_click)
-    focus_opts = build_row_focus_options(row_id_field, selected_row_id)
+    focus_opts = build_row_focus_options(row_id_field, selected_row_id, force_focus)
     if focus_opts:
         builder.configure_grid_options(**focus_opts)
     return builder.build()
@@ -748,17 +769,19 @@ def build_screenshot_status_style():
         return None
 
 
-def build_row_focus_options(row_id_field, selected_row_id):
+def build_row_focus_options(row_id_field, selected_row_id, force_focus=False):
     if not JS_CODE_AVAILABLE or JsCode is None or not row_id_field:
         return {}
 
     def_js = {}
-    selected_value = None
-    if selected_row_id not in (None, ""):
-        selected_value = str(selected_row_id)
     def_js["getRowId"] = JsCode(
         f"function(params) {{ return String(params.data.{row_id_field}); }}"
     )
+    if not force_focus:
+        return def_js
+    selected_value = None
+    if selected_row_id not in (None, ""):
+        selected_value = str(selected_row_id)
     def_js["context"] = {"selectedRowId": selected_value}
     focus_js = JsCode(
         f"""
@@ -793,7 +816,9 @@ def build_row_focus_options(row_id_field, selected_row_id):
     return def_js
 
 
-def build_match_grid_options(df, color_map, selected_row_id=None, row_id_field=None):
+def build_match_grid_options(
+    df, color_map, selected_row_id=None, row_id_field=None, force_focus=False
+):
     builder = GridOptionsBuilder.from_dataframe(df)
     builder.configure_default_column(
         editable=False,
@@ -859,7 +884,7 @@ def build_match_grid_options(df, color_map, selected_row_id=None, row_id_field=N
     link_click = build_product_link_click_handler()
     if link_click:
         builder.configure_grid_options(onCellClicked=link_click)
-    focus_opts = build_row_focus_options(row_id_field, selected_row_id)
+    focus_opts = build_row_focus_options(row_id_field, selected_row_id, force_focus)
     if focus_opts:
         builder.configure_grid_options(**focus_opts)
     return builder.build()
@@ -919,6 +944,38 @@ def select_export_directory(title):
     path = filedialog.askdirectory(title=title)
     root.destroy()
     return path or None
+
+
+def copy_to_clipboard(text):
+    if text is None:
+        return False, "内容为空"
+    value = str(text).strip()
+    if not value:
+        return False, "内容为空"
+    if os.name == "nt":
+        try:
+            subprocess.run(["clip"], input=value, text=True, check=True)
+            return True, None
+        except Exception:
+            pass
+    if TK_AVAILABLE:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(value)
+            root.update()
+            root.destroy()
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+    try:
+        import pyperclip
+
+        pyperclip.copy(value)
+        return True, None
+    except Exception:
+        return False, "无法复制，请检查 Tk 环境或安装 pyperclip"
 
 
 def sanitize_filename(value, default="未命名"):
@@ -1300,7 +1357,13 @@ def render_preprocess_tab(orders_paths, config_path):
     grid_response = AgGrid(
         display_df,
         gridOptions=build_order_grid_options(
-            display_df, allow_edit, selected_row_id, "_row_id"
+            display_df,
+            allow_edit,
+            selected_row_id,
+            "_row_id",
+            selection_mode="multiple",
+            use_checkbox=True,
+            header_checkbox=True,
         ),
         data_return_mode=DataReturnMode.AS_INPUT,
         update_mode=GridUpdateMode.MODEL_CHANGED,
@@ -1332,14 +1395,16 @@ def render_preprocess_tab(orders_paths, config_path):
         selected_rows = []
     elif isinstance(selected_rows, pd.DataFrame):
         selected_rows = selected_rows.to_dict("records")
-    selected_row = resolve_selected_row(
-        selected_rows, display_df, "_row_id", "preprocess_selected_row_id"
-    )
-    selected_ids = (
-        {int(selected_row["_row_id"])}
-        if selected_row and selected_row.get("_row_id") is not None
-        else set()
-    )
+    selected_ids = set()
+    for row in selected_rows:
+        if "_row_id" not in row:
+            continue
+        value = row.get("_row_id")
+        try:
+            value = int(value)
+        except Exception:
+            pass
+        selected_ids.add(value)
 
     action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
     with action_col1:
@@ -1362,9 +1427,9 @@ def render_preprocess_tab(orders_paths, config_path):
             set_order_df(new_df, notice="已新增空行", reset_grid=True)
             trigger_rerun()
     with action_col2:
-        if st.button("删除当前"):
+        if st.button("删除选中"):
             if not selected_ids:
-                st.warning("请先点击一行")
+                st.warning("请先勾选要删除的订单")
             else:
                 new_df = st.session_state.order_df[
                     ~st.session_state.order_df["_row_id"].isin(selected_ids)
@@ -1465,6 +1530,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
     st.subheader("匹配")
     orders_hint = f"{len(orders_paths)} 个文件" if orders_paths else "未选择"
     st.caption(f"订单：{orders_hint} ｜ 发票：{pdf_dir}")
+    matched_orders_for_screenshots = pd.DataFrame()
 
     if st.button("开始"):
         config = load_config(config_path)
@@ -1646,6 +1712,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
             matched_orders["invoice_id"] = matched_orders["_order_row"].map(
                 lambda idx: order_invoice_map.get(int(idx), {}).get("invoice_id", "")
             )
+        matched_orders_for_screenshots = matched_orders.copy()
         export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
         with export_col1:
             csv_data = matched_orders.to_csv(index=False, encoding="utf-8-sig")
@@ -1689,6 +1756,20 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                     if st.button(label, key=f"unmatched_open_{idx}"):
                         open_pdf_file(invoice.get("invoice_file", ""))
 
+    st.divider()
+    jump_disabled = (
+        st.session_state.match_result_df is None
+        or matched_orders_for_screenshots.empty
+    )
+    if st.button("进入截图管理", disabled=jump_disabled):
+        st.session_state.screenshot_prefill_df = matched_orders_for_screenshots
+        st.session_state.pending_tab = "截图"
+        trigger_rerun()
+    if st.session_state.match_result_df is None:
+        st.caption("请先完成匹配后进入截图管理。")
+    elif matched_orders_for_screenshots.empty:
+        st.caption("没有可进入截图管理的完美匹配订单。")
+
 
 def load_matched_orders_file(uploaded_file):
     name = uploaded_file.name.lower()
@@ -1724,14 +1805,22 @@ def render_screenshot_tab():
         st.caption("安装命令：pip install streamlit-aggrid")
         return
     uploaded = st.file_uploader("导入已匹配订单文件", type=["xlsx", "csv"])
-    if not uploaded:
+    prefill_df = st.session_state.get("screenshot_prefill_df")
+    if uploaded:
+        try:
+            df = load_matched_orders_file(uploaded)
+            st.session_state.screenshot_prefill_df = None
+        except Exception as exc:
+            st.error(f"导入失败：{exc}")
+            return
+    elif prefill_df is not None:
+        df = prefill_df.copy()
+        if df.empty:
+            st.warning("匹配结果为空，请先完成匹配或手动导入")
+            return
+        st.caption("已从匹配结果加载，可继续或上传文件替换。")
+    else:
         st.caption("请上传已匹配订单文件（由匹配页导出）。")
-        return
-
-    try:
-        df = load_matched_orders_file(uploaded)
-    except Exception as exc:
-        st.error(f"导入失败：{exc}")
         return
 
     df = prepare_screenshot_orders_df(df)
@@ -1741,10 +1830,19 @@ def render_screenshot_tab():
     display_df = add_auto_unique_id_column(display_df)
 
     selected_row_id = st.session_state.get("screenshot_selected_row_id")
-    display_df = add_focus_row_column(display_df, "_row_id", selected_row_id)
+    force_focus = bool(st.session_state.get("screenshot_selected_row_id_lock"))
+    display_df = add_focus_row_column(
+        display_df, "_row_id", selected_row_id, force_focus
+    )
     grid_response = AgGrid(
         display_df,
-        gridOptions=build_order_grid_options(display_df, editable=False, selected_row_id=selected_row_id, row_id_field="_row_id"),
+        gridOptions=build_order_grid_options(
+            display_df,
+            editable=False,
+            selected_row_id=selected_row_id,
+            row_id_field="_row_id",
+            force_focus=force_focus,
+        ),
         data_return_mode=DataReturnMode.AS_INPUT,
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         fit_columns_on_grid_load=True,
@@ -1770,13 +1868,34 @@ def render_screenshot_tab():
             st.info("请先在表格中点击一条订单的“截图状态”。")
         else:
             order_id = selected.get("order_id", "")
-            order_key = shots.build_order_key(order_id, selected.get("_row_id"))
-            label = f"订单号：{order_id}" if order_id else f"订单行：{selected.get('_row_id')}"
+            order_row = selected.get("_row_id")
+            order_key = shots.build_order_key(order_id, order_row)
+            header_col1, header_col2 = st.columns([4, 1], gap="small")
+            with header_col1:
+                label = (
+                    f"订单号：{order_id}" if str(order_id).strip() else f"订单行：{order_row}"
+                )
+                st.markdown(
+                    f"<div style='font-size:20px;font-weight:600'>{label}</div>",
+                    unsafe_allow_html=True,
+                )
+            with header_col2:
+                copy_disabled = not bool(str(order_id).strip())
+                if st.button(
+                    "复制",
+                    key=f"copy_order_id_{order_row}",
+                    disabled=copy_disabled,
+                ):
+                    ok, err = copy_to_clipboard(order_id)
+                    if ok:
+                        st.success("已复制订单号")
+                    else:
+                        st.warning(f"复制失败：{err}")
             row_ids = display_df["_row_id"].tolist()
             next_action = make_step_order_callback(row_ids, "screenshot_selected_row_id", 1)
             prev_action = make_step_order_callback(row_ids, "screenshot_selected_row_id", -1)
             shots.render_screenshot_manager(
-                order_key, label, on_next_order=next_action, on_prev_order=prev_action
+                order_key, on_next_order=next_action, on_prev_order=prev_action
             )
 
     st.subheader("导出")
@@ -1861,16 +1980,32 @@ def main():
     config_path = st.session_state.config_path
     output_path = st.session_state.output_path
 
-    tab1, tab2, tab3, tab4 = st.tabs(["预处理", "匹配", "配置", "截图"])
     color_map = {
         "完美匹配": st.session_state.color_perfect,
         "疑似匹配": st.session_state.color_suspect,
         "无匹配": st.session_state.color_nomatch,
     }
 
-    with tab1:
+    tab_labels = ["预处理", "匹配", "配置", "截图"]
+    pending_tab = st.session_state.get("pending_tab")
+    if pending_tab in tab_labels:
+        st.session_state.active_tab = pending_tab
+        st.session_state.pending_tab = None
+    current_tab = st.session_state.get("active_tab", tab_labels[0])
+    if current_tab not in tab_labels:
+        current_tab = tab_labels[0]
+    active_tab = st.radio(
+        "导航",
+        tab_labels,
+        index=tab_labels.index(current_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_tab",
+    )
+
+    if active_tab == "预处理":
         render_preprocess_tab(orders_paths, config_path)
-    with tab2:
+    elif active_tab == "匹配":
         render_match_tab(
             orders_paths,
             pdf_dir,
@@ -1879,11 +2014,10 @@ def main():
             recursive,
             color_map,
         )
-    with tab3:
+    elif active_tab == "配置":
         render_config_tab(config_path)
-    with tab4:
+    else:
         render_screenshot_tab()
-
 
 if __name__ == "__main__":
     main()

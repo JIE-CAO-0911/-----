@@ -135,6 +135,9 @@ def normalize_text(value):
 def format_order_id(value):
     if value is None:
         return ""
+    text = normalize_text(value)
+    if not text:
+        return ""
     if isinstance(value, (int,)):
         return str(value)
     if isinstance(value, float):
@@ -142,9 +145,10 @@ def format_order_id(value):
             return ""
         if abs(value - round(value)) < 0.000001:
             return str(int(round(value)))
-    text = normalize_text(value)
-    if not text:
-        return ""
+    if text.startswith("0") and re.fullmatch(r"\d+", text):
+        return text
+    if re.fullmatch(r"\d{15,}", text):
+        return text
     try:
         dec = Decimal(text)
     except InvalidOperation:
@@ -418,21 +422,39 @@ def load_orders(orders_path, config):
     if not orders_path.exists():
         die(f"Orders file not found: {orders_path}")
     try:
-        df = pd.read_excel(orders_path)
+        preview = pd.read_excel(orders_path, nrows=0)
+    except Exception as exc:
+        die(f"Failed to read orders file: {exc}")
+
+    preview.columns = [str(c).strip() for c in preview.columns]
+    columns = list(preview.columns)
+
+    order_cols = config.get("order_columns", {})
+    order_id_col = pick_column(
+        columns, order_cols.get("order_id"), ORDER_CANDIDATES["order_id"]
+    )
+    converters = None
+    if order_id_col:
+        converters = {
+            order_id_col: lambda x: "" if x is None else str(x).strip()
+        }
+
+    try:
+        df = pd.read_excel(orders_path, converters=converters)
     except Exception as exc:
         die(f"Failed to read orders file: {exc}")
 
     df.columns = [str(c).strip() for c in df.columns]
     columns = list(df.columns)
 
-    order_cols = config.get("order_columns", {})
     amount_col = pick_column(columns, order_cols.get("amount"), ORDER_CANDIDATES["amount"])
     if amount_col is None:
         die("Amount column not found. Set order_columns.amount in config.")
 
-    order_id_col = pick_column(
-        columns, order_cols.get("order_id"), ORDER_CANDIDATES["order_id"]
-    )
+    if order_id_col not in columns:
+        order_id_col = pick_column(
+            columns, order_cols.get("order_id"), ORDER_CANDIDATES["order_id"]
+        )
     date_col = pick_column(columns, order_cols.get("date"), ORDER_CANDIDATES["date"])
     vendor_col = pick_column(columns, order_cols.get("vendor"), ORDER_CANDIDATES["vendor"])
     desc_col = pick_column(
