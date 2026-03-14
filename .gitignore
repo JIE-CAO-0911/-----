@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Runtime cache and local data
+data_store/cache/
+data_store/history/
+preprocess_cache.json
+
+# Generated outputs
+match_result.xlsx
+*_orders.csv
+*_invoices.csv
+*_matches.csv
+*_unmatched_*.csv
+
+# Logs and temp
+*.log
+*.tmp
+*.temp

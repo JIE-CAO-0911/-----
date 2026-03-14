@@ -473,3 +473,22 @@ python -m streamlit run streamlit_app.py --server.port 8501
 本次已在 README 顶部给出建议标题。  
 GitHub 仓库真实标题（Repository name / Description）需要在 GitHub 网页端仓库设置中修改。
 
+---
+
+## 11. 开源规范文件清单
+
+为便于协作与维护，仓库建议同时包含以下文件（本仓库已补齐）：
+
+- [ENVIRONMENT.md](ENVIRONMENT.md)：环境安装与启动汇总
+- [requirements.txt](requirements.txt)：运行依赖清单
+- [CONTRIBUTING.md](CONTRIBUTING.md)：贡献流程约定
+- [SECURITY.md](SECURITY.md)：安全问题披露规范
+- [.gitignore](.gitignore)：运行产物与本地缓存忽略规则
+- [.editorconfig](.editorconfig)：编辑器统一格式
+- [.gitattributes](.gitattributes)：行尾与文本属性规范
+- `.github/ISSUE_TEMPLATE/*`：Bug/需求模板
+- `.github/pull_request_template.md`：PR 描述模板
+
+说明：
+
+- `LICENSE` 涉及法律授权策略（MIT/Apache/GPL 等），请按你的发布策略最终确认后再添加。
