@@ -2033,7 +2033,7 @@ def render_preprocess_tab(orders_paths, config_path):
         st.caption("安装命令：pip install streamlit-aggrid")
         return
 
-    col1, col2, col3 = st.columns([1, 2, 1.5])
+    col1, col2 = st.columns([1, 2.5])
     with col1:
         if st.button("解析"):
             try:
@@ -2057,8 +2057,6 @@ def render_preprocess_tab(orders_paths, config_path):
             except Exception as exc:
                 st.error(f"解析失败：{exc}")
     with col2:
-        allow_edit = st.checkbox("允许编辑", value=False)
-    with col3:
         reimbursed_upload = st.file_uploader(
             "导入已报销订单",
             type=["xlsx", "xls", "csv", "zip"],
@@ -2113,10 +2111,7 @@ def render_preprocess_tab(orders_paths, config_path):
     if st.session_state.get("preprocess_auto_save"):
         st.caption("自动保存已开启，已禁用手动“暂存”按钮。")
 
-    if allow_edit:
-        st.caption("双击单元格编辑，点击行后可删除当前行。")
-    else:
-        st.caption("当前为只读模式，如需修改请勾选“允许编辑”。")
+    st.caption("双击单元格编辑，点击行后可删除当前行。")
 
     current_df = ensure_editor_df(st.session_state.order_df)
     st.session_state.order_df = current_df
@@ -2175,7 +2170,7 @@ def render_preprocess_tab(orders_paths, config_path):
         display_df,
         gridOptions=build_order_grid_options(
             display_df,
-            allow_edit,
+            True,
             selected_row_id,
             "_row_id",
             selection_mode="multiple",
@@ -2193,7 +2188,7 @@ def render_preprocess_tab(orders_paths, config_path):
     )
 
     updated_data = grid_response.get("data")
-    if allow_edit and updated_data is not None:
+    if updated_data is not None:
         if isinstance(updated_data, list):
             updated_df = pd.DataFrame(updated_data)
         else:
