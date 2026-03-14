@@ -42,8 +42,6 @@ DEFAULT_CONFIG = {
         "date_days_tolerance": 7,
         "weights": {"amount": 0.6, "date": 0.2, "vendor": 0.2},
         "min_score": 0.7,
-        "allow_duplicate_orders": False,
-        "vendor_similarity_threshold": 0.6,
         "merge_multi_item_orders": True,
     },
 }
@@ -777,22 +775,6 @@ def score_vendor(inv_vendor, order_vendor):
     return SequenceMatcher(None, left, right).ratio()
 
 
-def max_vendor_similarity(order_vendor, invoice_vendor_norms):
-    left = normalize_vendor(order_vendor)
-    if not left:
-        return 0.0
-    best = 0.0
-    for right in invoice_vendor_norms:
-        if not right:
-            continue
-        score = SequenceMatcher(None, left, right).ratio()
-        if score > best:
-            best = score
-            if best >= 0.99:
-                break
-    return best
-
-
 def match_orders_invoices(orders_df, invoices, config):
     rules = config.get("match_rules", {})
     weights = rules.get("weights", {})
@@ -804,7 +786,6 @@ def match_orders_invoices(orders_df, invoices, config):
     tol_abs = rules.get("amount_tolerance", 0.0)
     tol_ratio = rules.get("amount_tolerance_ratio", 0.0)
     tol_days = int(rules.get("date_days_tolerance", 0))
-    allow_dupe_orders = bool(rules.get("allow_duplicate_orders", False))
 
     pairs = []
     for inv_idx, invoice in enumerate(invoices):
@@ -850,7 +831,7 @@ def match_orders_invoices(orders_df, invoices, config):
         order_idx = pair["order_index"]
         if inv_idx in matched_invoices:
             continue
-        if not allow_dupe_orders and order_idx in matched_orders:
+        if order_idx in matched_orders:
             continue
         matched_invoices.add(inv_idx)
         matched_orders.add(order_idx)
@@ -885,16 +866,11 @@ def match_orders_invoices(orders_df, invoices, config):
 
 
 def compute_order_match_statuses(orders_df, invoices, matches, config):
-    rules = config.get("match_rules", {})
-    vendor_threshold = float(rules.get("vendor_similarity_threshold", 0.6))
-
     invoice_amount_counts = {}
-    invoice_vendor_norms = []
     for invoice in invoices:
         key = amount_key(invoice.get("amount"))
         if key is not None:
             invoice_amount_counts[key] = invoice_amount_counts.get(key, 0) + 1
-        invoice_vendor_norms.append(normalize_vendor(invoice.get("vendor")))
 
     match_by_order = {int(item["order_row"]): item for item in matches}
     status_map = {}
@@ -913,13 +889,6 @@ def compute_order_match_statuses(orders_df, invoices, matches, config):
                 order["_amount"], matched.get("invoice_amount")
             )
 
-        vendor_match = False
-        if order["_vendor"]:
-            vendor_match = (
-                max_vendor_similarity(order["_vendor"], invoice_vendor_norms)
-                >= vendor_threshold
-            )
-
         if matched and matched_amount_ok and amount_match_count == 1:
             status = "完美匹配"
             reason = "金额一致且唯一匹配"
@@ -927,10 +896,6 @@ def compute_order_match_statuses(orders_df, invoices, matches, config):
         elif amount_match_count > 1:
             status = "疑似匹配"
             reason = "金额对应多张发票"
-            color = "orange"
-        elif vendor_match and amount_match_count == 0:
-            status = "疑似匹配"
-            reason = "开票单位相近但金额不一致"
             color = "orange"
         elif matched:
             status = "疑似匹配"

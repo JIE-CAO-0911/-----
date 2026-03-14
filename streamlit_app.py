@@ -201,6 +201,65 @@ def save_config(path, config):
         st.error(f"保存失败：{exc}")
 
 
+def sync_sidebar_config_state(config_path):
+    state_key = "sidebar_config_sync_path"
+    target = str(config_path or "")
+    if st.session_state.get(state_key) == target:
+        return
+
+    config = load_config(config_path)
+    order_cols = config.get("order_columns", {})
+    rules = config.get("match_rules", {})
+
+    st.session_state["sidebar_order_id_col"] = order_cols.get("order_id", "")
+    st.session_state["sidebar_amount_col"] = order_cols.get("amount", "")
+    st.session_state["sidebar_date_col"] = order_cols.get("date", "")
+    st.session_state["sidebar_vendor_col"] = order_cols.get("vendor", "")
+    st.session_state["sidebar_desc_col"] = order_cols.get("description", "")
+    st.session_state["sidebar_status_col"] = order_cols.get("status", "")
+    st.session_state["sidebar_link_col"] = order_cols.get("product_link", "")
+    st.session_state["sidebar_merge_items"] = bool(
+        rules.get("merge_multi_item_orders", True)
+    )
+    st.session_state[state_key] = target
+
+
+def render_sidebar_settings(config_path):
+    sync_sidebar_config_state(config_path)
+
+    st.subheader("列映射")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.text_input("订单号", key="sidebar_order_id_col")
+        st.text_input("实付", key="sidebar_amount_col")
+        st.text_input("时间", key="sidebar_date_col")
+        st.text_input("店铺", key="sidebar_vendor_col")
+    with col2:
+        st.text_input("商品", key="sidebar_desc_col")
+        st.text_input("状态", key="sidebar_status_col")
+        st.text_input("商品链接", key="sidebar_link_col")
+        st.checkbox("合并明细", key="sidebar_merge_items")
+
+    if st.button("保存设置", key="sidebar_save_settings"):
+        config = load_config(config_path)
+        config["order_columns"] = {
+            "order_id": str(st.session_state.get("sidebar_order_id_col", "")).strip(),
+            "amount": str(st.session_state.get("sidebar_amount_col", "")).strip(),
+            "date": str(st.session_state.get("sidebar_date_col", "")).strip(),
+            "vendor": str(st.session_state.get("sidebar_vendor_col", "")).strip(),
+            "description": str(st.session_state.get("sidebar_desc_col", "")).strip(),
+            "status": str(st.session_state.get("sidebar_status_col", "")).strip(),
+            "product_link": str(st.session_state.get("sidebar_link_col", "")).strip(),
+        }
+        config.setdefault("match_rules", {})
+        config["match_rules"]["merge_multi_item_orders"] = bool(
+            st.session_state.get("sidebar_merge_items", True)
+        )
+        config["match_rules"].pop("allow_duplicate_orders", None)
+        config["match_rules"].pop("vendor_similarity_threshold", None)
+        save_config(config_path, config)
+
+
 def ensure_data_directories():
     for folder in (
         DATA_ROOT_DIR,
@@ -249,8 +308,6 @@ def ensure_session_state():
         st.session_state.config_path = str(DEFAULT_CONFIG_PATH)
     if "output_path" not in st.session_state:
         st.session_state.output_path = str(DEFAULT_OUTPUT_PATH)
-    if "suspect_threshold" not in st.session_state:
-        st.session_state.suspect_threshold = 0.6
     if "color_perfect" not in st.session_state:
         st.session_state.color_perfect = "#d6f5d6"
     if "color_suspect" not in st.session_state:
@@ -305,6 +362,8 @@ def ensure_session_state():
         st.session_state.screenshot_prefill_df = None
     if "pending_tab" not in st.session_state:
         st.session_state.pending_tab = None
+    if "pending_match_auto_start" not in st.session_state:
+        st.session_state.pending_match_auto_start = False
     if not st.session_state.preprocess_cache_loaded:
         snapshot = load_preprocess_cache()
         if snapshot is not None:
@@ -1216,9 +1275,6 @@ def build_order_invoice_map(matches):
 
 
 def build_suspect_invoice_map(orders_df, invoices, config, matches):
-    rules = (config or {}).get("match_rules", {})
-    vendor_threshold = float(rules.get("vendor_similarity_threshold", 0.6))
-
     amount_map = {}
     inv_by_file = {}
     for invoice in invoices:
@@ -1235,13 +1291,6 @@ def build_suspect_invoice_map(orders_df, invoices, config, matches):
         amount_key = matcher.amount_key(order["_amount"])
         if amount_key is not None and amount_key in amount_map:
             suspects = amount_map[amount_key][:]
-        else:
-            order_vendor = order.get("_vendor")
-            if order_vendor:
-                for invoice in invoices:
-                    score = matcher.score_vendor(invoice.get("vendor"), order_vendor)
-                    if score is not None and score >= vendor_threshold:
-                        suspects.append(invoice)
 
         if not suspects:
             matched = match_map.get(int(order_idx))
@@ -1952,73 +2001,6 @@ def export_reimbursement_print_pdf(df, export_dir):
     return pdf_path, missing_invoices, image_errors
 
 
-def render_config_tab(config_path):
-    config = load_config(config_path)
-
-    st.subheader("列映射")
-    order_cols = config.get("order_columns", {})
-    col1, col2 = st.columns(2)
-    with col1:
-        order_id = st.text_input("订单号", value=order_cols.get("order_id", ""))
-        amount = st.text_input("实付", value=order_cols.get("amount", ""))
-        date_col = st.text_input("时间", value=order_cols.get("date", ""))
-    with col2:
-        vendor = st.text_input("店铺", value=order_cols.get("vendor", ""))
-        description = st.text_input("商品", value=order_cols.get("description", ""))
-        status = st.text_input("状态", value=order_cols.get("status", ""))
-        product_link = st.text_input("商品链接", value=order_cols.get("product_link", ""))
-
-    st.subheader("规则")
-    rules = config.get("match_rules", {})
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        amount_tol = st.number_input(
-            "金额容差", value=float(rules.get("amount_tolerance", 0.01)), step=0.01
-        )
-        min_score = st.number_input(
-            "最低分", value=float(rules.get("min_score", 0.7)), step=0.05
-        )
-    with r2:
-        date_tol = st.number_input(
-            "日期(天)", value=int(rules.get("date_days_tolerance", 7)), step=1
-        )
-        vendor_thresh = st.number_input(
-            "相似度",
-            value=float(rules.get("vendor_similarity_threshold", 0.6)),
-            min_value=0.0,
-            max_value=1.0,
-            step=0.05,
-        )
-    with r3:
-        allow_dupe = st.checkbox(
-            "允许多票",
-            value=bool(rules.get("allow_duplicate_orders", False)),
-        )
-        merge_items = st.checkbox(
-            "合并明细",
-            value=bool(rules.get("merge_multi_item_orders", True)),
-        )
-
-    if st.button("保存配置"):
-        config["order_columns"] = {
-            "order_id": order_id.strip(),
-            "amount": amount.strip(),
-            "date": date_col.strip(),
-            "vendor": vendor.strip(),
-            "description": description.strip(),
-            "status": status.strip(),
-            "product_link": product_link.strip(),
-        }
-        config.setdefault("match_rules", {})
-        config["match_rules"]["amount_tolerance"] = amount_tol
-        config["match_rules"]["date_days_tolerance"] = int(date_tol)
-        config["match_rules"]["min_score"] = min_score
-        config["match_rules"]["allow_duplicate_orders"] = allow_dupe
-        config["match_rules"]["vendor_similarity_threshold"] = vendor_thresh
-        config["match_rules"]["merge_multi_item_orders"] = merge_items
-        save_config(config_path, config)
-
-
 def render_preprocess_tab(orders_paths, config_path):
     st.subheader("预处理")
     if st.session_state.preprocess_notice:
@@ -2371,6 +2353,16 @@ def render_preprocess_tab(orders_paths, config_path):
             )
             trigger_rerun()
 
+    st.divider()
+    if st.button(
+        "开始发票匹配",
+        key="preprocess_start_match",
+        disabled=st.session_state.order_df is None or st.session_state.order_df.empty,
+    ):
+        st.session_state.pending_tab = "匹配"
+        st.session_state.pending_match_auto_start = True
+        trigger_rerun()
+
 
 def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive, color_map):
     st.subheader("匹配")
@@ -2378,12 +2370,9 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
     st.caption(f"订单：{orders_hint} ｜ 发票：{pdf_dir}")
     matched_orders_for_screenshots = pd.DataFrame()
 
-    if st.button("开始"):
+    auto_start_match = bool(st.session_state.pop("pending_match_auto_start", False))
+    if st.button("开始") or auto_start_match:
         config = load_config(config_path)
-        config.setdefault("match_rules", {})
-        config["match_rules"]["vendor_similarity_threshold"] = float(
-            st.session_state.suspect_threshold
-        )
         try:
             backend = matcher.resolve_pdf_backend()
             if backend is None:
@@ -2832,15 +2821,7 @@ def main():
 
         with st.expander("设置", expanded=True):
             st.text_input("配置文件", key="config_path")
-            st.text_input("输出文件", key="output_path")
-            st.subheader("疑似阈值")
-            st.slider(
-                "相似度",
-                min_value=0.0,
-                max_value=1.0,
-                step=0.05,
-                key="suspect_threshold",
-            )
+            render_sidebar_settings(st.session_state.config_path)
             st.subheader("颜色")
             st.color_picker("完美", key="color_perfect")
             st.color_picker("疑似", key="color_suspect")
@@ -2857,7 +2838,7 @@ def main():
         "无匹配": st.session_state.color_nomatch,
     }
 
-    tab_labels = ["预处理", "匹配", "配置", "截图"]
+    tab_labels = ["预处理", "匹配", "截图"]
     pending_tab = st.session_state.get("pending_tab")
     if pending_tab in tab_labels:
         st.session_state.active_tab = pending_tab
@@ -2885,8 +2866,6 @@ def main():
             recursive,
             color_map,
         )
-    elif active_tab == "配置":
-        render_config_tab(config_path)
     else:
         render_screenshot_tab()
 
