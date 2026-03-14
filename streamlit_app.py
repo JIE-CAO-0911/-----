@@ -529,6 +529,8 @@ def ensure_session_state():
         st.session_state.pending_tab = None
     if "pending_match_auto_start" not in st.session_state:
         st.session_state.pending_match_auto_start = False
+    if "pending_clear_add_order_form" not in st.session_state:
+        st.session_state.pending_clear_add_order_form = False
     if not st.session_state.preprocess_cache_loaded:
         snapshot = load_preprocess_cache()
         if snapshot is not None:
@@ -2623,43 +2625,61 @@ def render_preprocess_tab(orders_paths, config_path):
 
     with tool_tab_add:
         st.caption("手工补录单条订单信息，提交后会进入预处理表格。")
-        new_cols = st.columns(3)
-        with new_cols[0]:
-            new_order_id = st.text_input("订单号", key="new_order_id")
-            new_vendor = st.text_input("店铺", key="new_vendor")
-        with new_cols[1]:
-            new_desc = st.text_input("明细", key="new_desc")
-            new_amount = st.text_input("实付", key="new_amount")
-        with new_cols[2]:
-            new_status = st.text_input("状态", key="new_status")
-            new_date = st.text_input("时间", key="new_date")
-            new_link = st.text_input("商品链接", key="new_link")
+        if st.session_state.get("pending_clear_add_order_form", False):
+            st.session_state["new_order_id"] = ""
+            st.session_state["new_vendor"] = ""
+            st.session_state["new_desc"] = ""
+            st.session_state["new_amount"] = ""
+            st.session_state["new_date"] = ""
+            st.session_state["new_link"] = ""
+            st.session_state["pending_clear_add_order_form"] = False
+        with st.form("preprocess_add_order_form", clear_on_submit=False):
+            new_cols = st.columns(3)
+            with new_cols[0]:
+                new_order_id = st.text_input("订单号", key="new_order_id")
+                new_vendor = st.text_input("店铺", key="new_vendor")
+            with new_cols[1]:
+                new_desc = st.text_input("明细", key="new_desc")
+                new_amount = st.text_input("实付", key="new_amount")
+            with new_cols[2]:
+                new_date = st.text_input("时间", key="new_date")
+                new_link = st.text_input("商品链接", key="new_link")
+                st.caption("交易状态默认：交易成功")
 
-        if st.button("添加订单", key="preprocess_add_order", type="secondary"):
-            amount_value = matcher.parse_amount(new_amount) if new_amount else None
-            next_row_id = st.session_state.order_row_id_seq
-            new_row = {
-                "order_id": matcher.format_order_id(new_order_id),
-                "vendor": new_vendor.strip(),
-                "description": new_desc.strip(),
-                "product_link": new_link.strip(),
-                "amount": amount_value if amount_value is not None else new_amount,
-                "order_status": new_status.strip(),
-                "order_date": new_date.strip(),
-                "_row_id": next_row_id,
-            }
-            new_df = pd.concat(
-                [st.session_state.order_df, pd.DataFrame([new_row])],
-                ignore_index=True,
+            submitted = st.form_submit_button(
+                "添加订单", key="preprocess_add_order", type="secondary"
             )
-            apply_preprocess_change(
-                new_df,
-                notice="已添加",
-                reset_grid=True,
-                reset_row_ids=False,
-                track_history=True,
-            )
-            trigger_rerun()
+
+        if submitted:
+            formatted_order_id = matcher.format_order_id(new_order_id)
+            if not formatted_order_id:
+                st.warning("请填写订单号后再添加，避免被误判为已报销订单。")
+            else:
+                amount_value = matcher.parse_amount(new_amount) if new_amount else None
+                next_row_id = st.session_state.order_row_id_seq
+                new_row = {
+                    "order_id": formatted_order_id,
+                    "vendor": new_vendor.strip(),
+                    "description": new_desc.strip(),
+                    "product_link": new_link.strip(),
+                    "amount": amount_value if amount_value is not None else new_amount,
+                    "order_status": "交易成功",
+                    "order_date": new_date.strip(),
+                    "_row_id": next_row_id,
+                }
+                new_df = pd.concat(
+                    [st.session_state.order_df, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+                apply_preprocess_change(
+                    new_df,
+                    notice="已添加",
+                    reset_grid=True,
+                    reset_row_ids=False,
+                    track_history=True,
+                )
+                st.session_state["pending_clear_add_order_form"] = True
+                trigger_rerun()
 
 
 def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive, color_map):
