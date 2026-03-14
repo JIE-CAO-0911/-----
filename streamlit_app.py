@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import io
 import json
 import os
@@ -70,10 +72,17 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "invoice_matcher_config.json"
 DEFAULT_OUTPUT_PATH = APP_DIR / "match_result.xlsx"
 DEFAULT_ORDER_FILES = ["订单数据.xlsx", "订单数据 (1).xlsx"]
+DATA_ROOT_DIR = APP_DIR / "data_store"
+CACHE_ROOT_DIR = DATA_ROOT_DIR / "cache"
+HISTORY_ROOT_DIR = DATA_ROOT_DIR / "history"
+PREPROCESS_CACHE_DIR = CACHE_ROOT_DIR / "preprocess"
+SCREENSHOT_CACHE_DIR = CACHE_ROOT_DIR / "screenshot"
 AUTO_SHUTDOWN_IDLE_SECONDS = 1
 AUTO_SHUTDOWN_CHECK_SECONDS = 0.5
 AUTO_SHUTDOWN_STARTED = False
-PREPROCESS_CACHE_PATH = APP_DIR / "preprocess_cache.json"
+PREPROCESS_CACHE_PATH = PREPROCESS_CACHE_DIR / "state.json"
+LEGACY_PREPROCESS_CACHE_PATH = APP_DIR / "preprocess_cache.json"
+SCREENSHOT_CACHE_PATH = SCREENSHOT_CACHE_DIR / "state.json"
 PREPROCESS_HISTORY_LIMIT = 20
 GRID_CUSTOM_CSS = {
     ".ag-cell.product-link-cell": {
@@ -192,7 +201,33 @@ def save_config(path, config):
         st.error(f"保存失败：{exc}")
 
 
+def ensure_data_directories():
+    for folder in (
+        DATA_ROOT_DIR,
+        CACHE_ROOT_DIR,
+        HISTORY_ROOT_DIR,
+        PREPROCESS_CACHE_DIR,
+        SCREENSHOT_CACHE_DIR,
+    ):
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+def to_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return default
+
+
 def ensure_session_state():
+    ensure_data_directories()
     if "order_df" not in st.session_state:
         st.session_state.order_df = pd.DataFrame(columns=EDITOR_COLUMNS)
     shots.init_session_state()
@@ -236,12 +271,34 @@ def ensure_session_state():
         st.session_state.reimbursed_source_rows = 0
     if "preprocess_auto_save" not in st.session_state:
         st.session_state.preprocess_auto_save = True
+    st.session_state.preprocess_auto_save = to_bool(
+        st.session_state.get("preprocess_auto_save"), default=True
+    )
     if "preprocess_undo_stack" not in st.session_state:
         st.session_state.preprocess_undo_stack = []
     if "preprocess_redo_stack" not in st.session_state:
         st.session_state.preprocess_redo_stack = []
     if "preprocess_cache_loaded" not in st.session_state:
         st.session_state.preprocess_cache_loaded = False
+    if "screenshot_orders_df" not in st.session_state:
+        st.session_state.screenshot_orders_df = None
+    if "screenshot_notice" not in st.session_state:
+        st.session_state.screenshot_notice = ""
+    if "screenshot_auto_save" not in st.session_state:
+        st.session_state.screenshot_auto_save = True
+    st.session_state.screenshot_auto_save = to_bool(
+        st.session_state.get("screenshot_auto_save"), default=True
+    )
+    if "settings_migrated_v1" not in st.session_state:
+        st.session_state.screenshot_auto_save = True
+        st.session_state.settings_migrated_v1 = True
+    if "settings_migrated_v2" not in st.session_state:
+        st.session_state.screenshot_auto_save = True
+        st.session_state.settings_migrated_v2 = True
+    if "screenshot_cache_loaded" not in st.session_state:
+        st.session_state.screenshot_cache_loaded = False
+    if "screenshot_last_saved_signature" not in st.session_state:
+        st.session_state.screenshot_last_saved_signature = ""
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = "预处理"
     if "screenshot_prefill_df" not in st.session_state:
@@ -259,6 +316,17 @@ def ensure_session_state():
             st.session_state.preprocess_undo_stack = []
             st.session_state.preprocess_redo_stack = []
         st.session_state.preprocess_cache_loaded = True
+    if not st.session_state.screenshot_cache_loaded:
+        snapshot = load_screenshot_cache()
+        if snapshot is not None:
+            restore_screenshot_snapshot(
+                snapshot,
+                notice=f"已恢复截图暂存（{len(snapshot.get('rows', []))} 条）",
+            )
+            st.session_state.screenshot_last_saved_signature = screenshot_snapshot_signature(
+                snapshot
+            )
+        st.session_state.screenshot_cache_loaded = True
 
 
 def orders_df_for_editor(orders_df):
@@ -644,6 +712,7 @@ def trim_history(stack):
 def save_preprocess_cache(snapshot=None):
     if snapshot is None:
         snapshot = snapshot_from_order_df()
+    ensure_data_directories()
     payload = {
         "version": 1,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -656,12 +725,20 @@ def save_preprocess_cache(snapshot=None):
 
 
 def load_preprocess_cache():
-    if not PREPROCESS_CACHE_PATH.exists():
-        return None
-    try:
-        with open(PREPROCESS_CACHE_PATH, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except Exception:
+    candidate_paths = [PREPROCESS_CACHE_PATH, LEGACY_PREPROCESS_CACHE_PATH]
+    payload = None
+    used_path = None
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            used_path = path
+            break
+        except Exception:
+            payload = None
+    if payload is None:
         return None
 
     snapshot = payload.get("snapshot")
@@ -675,7 +752,13 @@ def load_preprocess_cache():
         row_id_seq = int(row_id_seq)
     except Exception:
         row_id_seq = 1
-    return {"rows": rows, "row_id_seq": row_id_seq}
+    snapshot = {"rows": rows, "row_id_seq": row_id_seq}
+    if used_path == LEGACY_PREPROCESS_CACHE_PATH and not PREPROCESS_CACHE_PATH.exists():
+        try:
+            save_preprocess_cache(snapshot)
+        except Exception:
+            pass
+    return snapshot
 
 
 def restore_preprocess_snapshot(snapshot, notice=None, reset_grid=True):
@@ -768,6 +851,162 @@ def redo_preprocess_change():
     restore_preprocess_snapshot(snapshot, notice="已重做", reset_grid=True)
     maybe_auto_save_preprocess()
     return True
+
+
+def ensure_screenshot_df_for_cache(df):
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame()
+    working = df.copy()
+    defaults = {
+        "order_id": "",
+        "vendor": "",
+        "description": "",
+        "product_link": "",
+        "amount": "",
+        "order_status": "",
+        "order_date": "",
+    }
+    for col, default in defaults.items():
+        if col not in working.columns:
+            working[col] = default
+    if "_row_id" not in working.columns:
+        working["_row_id"] = range(1, len(working) + 1)
+    working["order_date"] = working["order_date"].apply(format_editor_date)
+    return working
+
+
+def serialize_screenshot_store(store):
+    serialized = {}
+    for order_key, entry in (store or {}).items():
+        safe_key = str(order_key)
+        order_images = []
+        payment_images = []
+        for img in entry.get(shots.CATEGORY_ORDER, []):
+            if isinstance(img, (bytes, bytearray)):
+                order_images.append(base64.b64encode(bytes(img)).decode("ascii"))
+        for img in entry.get(shots.CATEGORY_PAYMENT, []):
+            if isinstance(img, (bytes, bytearray)):
+                payment_images.append(base64.b64encode(bytes(img)).decode("ascii"))
+        serialized[safe_key] = {
+            shots.CATEGORY_ORDER: order_images,
+            shots.CATEGORY_PAYMENT: payment_images,
+        }
+    return serialized
+
+
+def deserialize_screenshot_store(data):
+    store = {}
+    if not isinstance(data, dict):
+        return store
+    for order_key, entry in data.items():
+        order_list = []
+        payment_list = []
+        for encoded in (entry or {}).get(shots.CATEGORY_ORDER, []):
+            if not isinstance(encoded, str):
+                continue
+            try:
+                order_list.append(base64.b64decode(encoded.encode("ascii")))
+            except Exception:
+                continue
+        for encoded in (entry or {}).get(shots.CATEGORY_PAYMENT, []):
+            if not isinstance(encoded, str):
+                continue
+            try:
+                payment_list.append(base64.b64decode(encoded.encode("ascii")))
+            except Exception:
+                continue
+        store[str(order_key)] = {
+            shots.CATEGORY_ORDER: order_list,
+            shots.CATEGORY_PAYMENT: payment_list,
+        }
+    return store
+
+
+def snapshot_from_screenshot_state(df=None, store=None):
+    if df is None:
+        df = st.session_state.get("screenshot_orders_df")
+    if store is None:
+        store = st.session_state.get("screenshot_store", {})
+
+    working_df = ensure_screenshot_df_for_cache(df)
+    rows = []
+    for record in working_df.to_dict("records"):
+        rows.append({k: serialize_preprocess_value(v) for k, v in record.items()})
+
+    return {
+        "rows": rows,
+        "store": serialize_screenshot_store(store),
+    }
+
+
+def screenshot_snapshot_signature(snapshot):
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def save_screenshot_cache(snapshot=None):
+    if snapshot is None:
+        snapshot = snapshot_from_screenshot_state()
+    ensure_data_directories()
+    payload = {
+        "version": 1,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "snapshot": snapshot,
+    }
+    with open(SCREENSHOT_CACHE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return SCREENSHOT_CACHE_PATH
+
+
+def load_screenshot_cache():
+    if not SCREENSHOT_CACHE_PATH.exists():
+        return None
+    try:
+        with open(SCREENSHOT_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    rows = snapshot.get("rows")
+    store = snapshot.get("store")
+    if not isinstance(rows, list) or not isinstance(store, dict):
+        return None
+    return {"rows": rows, "store": store}
+
+
+def restore_screenshot_snapshot(snapshot, notice=None):
+    rows = snapshot.get("rows", []) if isinstance(snapshot, dict) else []
+    store_data = snapshot.get("store", {}) if isinstance(snapshot, dict) else {}
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    st.session_state.screenshot_orders_df = ensure_screenshot_df_for_cache(df)
+    st.session_state.screenshot_store = deserialize_screenshot_store(store_data)
+    if notice:
+        st.session_state.screenshot_notice = notice
+
+
+def maybe_auto_save_screenshot(force=False):
+    if not force and not st.session_state.get("screenshot_auto_save", False):
+        return
+    try:
+        snapshot = snapshot_from_screenshot_state()
+        signature = screenshot_snapshot_signature(snapshot)
+        if (
+            not force
+            and signature == st.session_state.get("screenshot_last_saved_signature", "")
+        ):
+            return
+        save_screenshot_cache(snapshot)
+        st.session_state.screenshot_last_saved_signature = signature
+    except Exception as exc:
+        st.session_state.screenshot_notice = f"截图自动保存失败：{exc}"
+
+
+def on_screenshot_auto_save_toggle():
+    if st.session_state.get("screenshot_auto_save", False):
+        maybe_auto_save_screenshot(force=True)
 
 
 def trigger_rerun():
@@ -1845,7 +2084,7 @@ def render_preprocess_tab(orders_paths, config_path):
 
     tools_col1, tools_col2, tools_col3, tools_col4 = st.columns([1, 1, 1, 1.2])
     with tools_col1:
-        if st.button("暂存"):
+        if st.button("暂存", disabled=bool(st.session_state.get("preprocess_auto_save"))):
             try:
                 save_preprocess_cache()
                 st.session_state.preprocess_notice = "暂存成功"
@@ -1871,6 +2110,8 @@ def render_preprocess_tab(orders_paths, config_path):
     st.caption(
         f"撤回/重做最多保留 {PREPROCESS_HISTORY_LIMIT} 步：可撤回 {undo_count}，可重做 {redo_count}"
     )
+    if st.session_state.get("preprocess_auto_save"):
+        st.caption("自动保存已开启，已禁用手动“暂存”按钮。")
 
     if allow_edit:
         st.caption("双击单元格编辑，点击行后可删除当前行。")
@@ -2389,33 +2630,23 @@ def load_matched_orders_file(uploaded_file):
 
 
 def prepare_screenshot_orders_df(df):
-    df = df.copy()
-    defaults = {
-        "order_id": "",
-        "vendor": "",
-        "description": "",
-        "product_link": "",
-        "amount": "",
-        "order_status": "",
-        "order_date": "",
-    }
-    for col, default in defaults.items():
-        if col not in df.columns:
-            df[col] = default
-    if "_row_id" not in df.columns:
-        df["_row_id"] = range(1, len(df) + 1)
-    df["order_date"] = df["order_date"].apply(format_editor_date)
-    return df
+    return ensure_screenshot_df_for_cache(df)
 
 
 def render_screenshot_tab():
     st.subheader("截图管理")
+    if st.session_state.get("screenshot_notice"):
+        st.success(st.session_state.screenshot_notice)
+        st.session_state.screenshot_notice = ""
+
     if not AGGRID_AVAILABLE:
         st.error("未安装可编辑表格组件：streamlit-aggrid")
         st.caption("安装命令：pip install streamlit-aggrid")
         return
+
     uploaded = st.file_uploader("导入已匹配订单文件", type=["xlsx", "csv"])
     prefill_df = st.session_state.get("screenshot_prefill_df")
+    cached_df = st.session_state.get("screenshot_orders_df")
     if uploaded:
         try:
             df = load_matched_orders_file(uploaded)
@@ -2425,17 +2656,49 @@ def render_screenshot_tab():
             return
     elif prefill_df is not None:
         df = prefill_df.copy()
+        st.session_state.screenshot_prefill_df = None
         if df.empty:
             st.warning("匹配结果为空，请先完成匹配或手动导入")
             return
         st.caption("已从匹配结果加载，可继续或上传文件替换。")
+    elif isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
+        df = cached_df.copy()
+        st.caption("已从本地截图暂存加载，可继续或上传文件替换。")
     else:
         st.caption("请上传已匹配订单文件（由匹配页导出）。")
         return
 
     df = prepare_screenshot_orders_df(df)
+    st.session_state.screenshot_orders_df = df.copy()
+
     st.caption(f"已导入 {len(df)} 行")
     st.caption("点击“截图状态”可进入截图管理。")
+    tools_col1, tools_col2 = st.columns([1, 1.2])
+    with tools_col1:
+        if st.button(
+            "暂存",
+            key="screenshot_manual_save",
+            disabled=bool(st.session_state.get("screenshot_auto_save")),
+        ):
+            try:
+                snapshot = snapshot_from_screenshot_state(df=df)
+                save_screenshot_cache(snapshot)
+                st.session_state.screenshot_last_saved_signature = (
+                    screenshot_snapshot_signature(snapshot)
+                )
+                st.session_state.screenshot_notice = "暂存成功"
+                trigger_rerun()
+            except Exception as exc:
+                st.error(f"暂存失败：{exc}")
+    with tools_col2:
+        st.checkbox(
+            "自动保存",
+            key="screenshot_auto_save",
+            on_change=on_screenshot_auto_save_toggle,
+        )
+    if st.session_state.get("screenshot_auto_save"):
+        st.caption("自动保存已开启，已禁用手动“暂存”按钮。")
+
     display_df = add_screenshot_status_column(df, "order_id", "_row_id")
     display_df = add_auto_unique_id_column(display_df)
 
@@ -2507,6 +2770,9 @@ def render_screenshot_tab():
             shots.render_screenshot_manager(
                 order_key, on_next_order=next_action, on_prev_order=prev_action
             )
+
+    st.session_state.screenshot_orders_df = df.copy()
+    maybe_auto_save_screenshot()
 
     st.subheader("导出")
     export_col1, export_col2, export_col3 = st.columns([1, 1, 3])
