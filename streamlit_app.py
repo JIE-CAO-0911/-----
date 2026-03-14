@@ -127,6 +127,41 @@ EDITOR_COLUMNS = [
     "order_date",
     "_row_id",
 ]
+REIMBURSED_ORDER_ID_CANDIDATES = [
+    "order_id",
+    "订单号",
+    "订单编号",
+    "订单ID",
+    "订单id",
+]
+REIMBURSED_DETAIL_SHEET_CANDIDATES = [
+    "details",
+    "detail",
+    "报销明细",
+    "明细",
+]
+REIMBURSED_AMOUNT_CANDIDATES = [
+    "amount",
+    "实付",
+    "实付金额",
+    "金额",
+    "支付金额",
+]
+REIMBURSED_DATE_CANDIDATES = [
+    "order_date",
+    "时间",
+    "订单时间",
+    "下单时间",
+    "订单提交时间",
+    "日期",
+]
+REIMBURSED_VENDOR_CANDIDATES = [
+    "vendor",
+    "店铺",
+    "店铺名称",
+    "商家",
+    "卖家",
+]
 
 
 def default_orders_path():
@@ -197,6 +232,16 @@ def ensure_session_state():
         st.session_state.color_nomatch = "#ffd6d6"
     if "preprocess_notice" not in st.session_state:
         st.session_state.preprocess_notice = ""
+    if "reimbursed_notice" not in st.session_state:
+        st.session_state.reimbursed_notice = ""
+    if "reimbursed_order_ids" not in st.session_state:
+        st.session_state.reimbursed_order_ids = []
+    if "reimbursed_fallback_keys" not in st.session_state:
+        st.session_state.reimbursed_fallback_keys = []
+    if "reimbursed_source_name" not in st.session_state:
+        st.session_state.reimbursed_source_name = ""
+    if "reimbursed_source_rows" not in st.session_state:
+        st.session_state.reimbursed_source_rows = 0
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = "预处理"
     if "screenshot_prefill_df" not in st.session_state:
@@ -249,6 +294,217 @@ def parse_orders_paths(text):
     flat = text.replace(";", "\n")
     paths = [line.strip() for line in flat.splitlines() if line.strip()]
     return paths
+
+
+def find_column_by_candidates(columns, candidates):
+    stripped = {str(col).strip(): col for col in columns}
+    lowered = {str(col).strip().lower(): col for col in columns}
+    for cand in candidates:
+        if cand in stripped:
+            return stripped[cand]
+        cand_lower = str(cand).strip().lower()
+        if cand_lower in lowered:
+            return lowered[cand_lower]
+    return None
+
+
+def normalize_order_id_for_match(value):
+    return matcher.format_order_id(value).strip()
+
+
+def normalize_amount_for_match(value):
+    amount = matcher.parse_amount(value)
+    if amount is None:
+        return ""
+    return f"{round(float(amount), 2):.2f}"
+
+
+def normalize_date_for_match(value):
+    parsed = matcher.parse_date(value)
+    if parsed:
+        return parsed.isoformat()
+    text = str(value or "").strip()
+    return "" if text.lower() in {"", "nan", "none"} else text
+
+
+def normalize_vendor_for_match(value):
+    return matcher.normalize_vendor(value)
+
+
+def build_amount_date_vendor_key(amount, order_date, vendor):
+    amount_key = normalize_amount_for_match(amount)
+    date_key = normalize_date_for_match(order_date)
+    vendor_key = normalize_vendor_for_match(vendor)
+    if not amount_key or not date_key or not vendor_key:
+        return ""
+    return "|".join([amount_key, date_key, vendor_key])
+
+
+def deduplicate_editor_orders(df):
+    if df is None or df.empty:
+        return df, 0
+
+    key_df = pd.DataFrame(index=df.index)
+    key_df["_k_order_id"] = df["order_id"].apply(normalize_order_id_for_match)
+    key_df["_k_vendor"] = df["vendor"].apply(
+        lambda v: matcher.normalize_text(v).strip().lower()
+    )
+    key_df["_k_description"] = df["description"].apply(
+        lambda v: matcher.normalize_text(v).strip().lower()
+    )
+    key_df["_k_link"] = df["product_link"].apply(
+        lambda v: matcher.normalize_text(v).strip().lower()
+    )
+    key_df["_k_amount"] = df["amount"].apply(normalize_amount_for_match)
+    key_df["_k_status"] = df["order_status"].apply(
+        lambda v: matcher.normalize_text(v).strip().lower()
+    )
+    key_df["_k_date"] = df["order_date"].apply(normalize_date_for_match)
+
+    duplicated = key_df.duplicated(keep="first")
+    removed = int(duplicated.sum())
+    if removed == 0:
+        return df, 0
+    deduped = df.loc[~duplicated].reset_index(drop=True)
+    return deduped, removed
+
+
+def compute_reimbursed_mask(df, reimbursed_order_ids, reimbursed_fallback_keys):
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    if not reimbursed_order_ids and not reimbursed_fallback_keys:
+        return pd.Series(False, index=df.index)
+
+    order_ids = df["order_id"].apply(normalize_order_id_for_match)
+    id_mask = order_ids.apply(lambda value: bool(value) and value in reimbursed_order_ids)
+
+    if not reimbursed_fallback_keys:
+        return id_mask
+
+    fallback_keys = df.apply(
+        lambda row: build_amount_date_vendor_key(
+            row.get("amount"),
+            row.get("order_date"),
+            row.get("vendor"),
+        ),
+        axis=1,
+    )
+    fallback_mask = order_ids.apply(lambda value: not bool(value)) & fallback_keys.apply(
+        lambda key: bool(key) and key in reimbursed_fallback_keys
+    )
+    return id_mask | fallback_mask
+
+
+def add_reimbursed_flag_column(df, reimbursed_order_ids, reimbursed_fallback_keys):
+    display_df = df.copy()
+    if "_reimbursed" in display_df.columns:
+        display_df = display_df.drop(columns=["_reimbursed"])
+    mask = compute_reimbursed_mask(
+        display_df, reimbursed_order_ids, reimbursed_fallback_keys
+    )
+    display_df.insert(0, "_reimbursed", mask.values)
+    return display_df
+
+
+def load_reimbursed_excel(data):
+    workbook = pd.read_excel(io.BytesIO(data), sheet_name=None)
+    if not workbook:
+        raise ValueError("Excel 文件为空")
+
+    for sheet in REIMBURSED_DETAIL_SHEET_CANDIDATES:
+        for name, frame in workbook.items():
+            if str(name).strip().lower() == sheet.lower():
+                return frame
+
+    for frame in workbook.values():
+        if not frame.empty:
+            return frame
+    return next(iter(workbook.values()))
+
+
+def load_reimbursed_orders_from_zip(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        files = [name for name in zf.namelist() if not name.endswith("/")]
+        if not files:
+            raise ValueError("ZIP 文件为空")
+
+        def score(name):
+            base = Path(name).name.lower()
+            priority = 0
+            if "detail" in base or "明细" in base:
+                priority -= 10
+            if base.endswith(".xlsx"):
+                priority -= 5
+            elif base.endswith(".xls"):
+                priority -= 4
+            elif base.endswith(".csv"):
+                priority -= 3
+            return (priority, len(base))
+
+        for member in sorted(files, key=score):
+            lower = member.lower()
+            if lower.endswith((".xlsx", ".xls")):
+                with zf.open(member) as fh:
+                    data_bytes = fh.read()
+                try:
+                    return load_reimbursed_excel(data_bytes)
+                except Exception:
+                    continue
+            if lower.endswith(".csv"):
+                with zf.open(member) as fh:
+                    data_bytes = fh.read()
+                try:
+                    return pd.read_csv(io.BytesIO(data_bytes))
+                except Exception:
+                    continue
+
+    raise ValueError("ZIP 中未找到可用的报销明细文件（xlsx/xls/csv）")
+
+
+def load_reimbursed_orders_file(uploaded_file):
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+    if name.endswith(".zip"):
+        return load_reimbursed_orders_from_zip(data)
+    if name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(data))
+    if name.endswith((".xlsx", ".xls")):
+        return load_reimbursed_excel(data)
+    raise ValueError("不支持的文件类型")
+
+
+def collect_reimbursed_matchers(df):
+    if df is None or df.empty:
+        return {"order_ids": [], "fallback_keys": []}
+
+    order_col = find_column_by_candidates(df.columns, REIMBURSED_ORDER_ID_CANDIDATES)
+    amount_col = find_column_by_candidates(df.columns, REIMBURSED_AMOUNT_CANDIDATES)
+    date_col = find_column_by_candidates(df.columns, REIMBURSED_DATE_CANDIDATES)
+    vendor_col = find_column_by_candidates(df.columns, REIMBURSED_VENDOR_CANDIDATES)
+
+    order_ids = set()
+    fallback_keys = set()
+
+    for _, row in df.iterrows():
+        order_id = normalize_order_id_for_match(row.get(order_col)) if order_col else ""
+        if order_id:
+            order_ids.add(order_id)
+            continue
+        key = build_amount_date_vendor_key(
+            row.get(amount_col) if amount_col else None,
+            row.get(date_col) if date_col else None,
+            row.get(vendor_col) if vendor_col else None,
+        )
+        if key:
+            fallback_keys.add(key)
+
+    if not order_ids and not fallback_keys:
+        raise ValueError("未读取到有效订单号，且无法生成金额+日期+店铺兜底键")
+
+    return {
+        "order_ids": sorted(order_ids),
+        "fallback_keys": sorted(fallback_keys),
+    }
 
 
 def format_editor_date(value):
@@ -623,6 +879,8 @@ def build_order_grid_options(
     )
     if "_focus_row" in df.columns:
         builder.configure_column("_focus_row", hide=True, editable=False)
+    if "_reimbursed" in df.columns:
+        builder.configure_column("_reimbursed", hide=True, editable=False)
     if "auto_unique_id" in df.columns:
         builder.configure_column(
             "auto_unique_id", header_name="auto_unique_id", width=90, editable=False
@@ -636,7 +894,18 @@ def build_order_grid_options(
             editable=False,
             cellStyle=status_style,
         )
-    builder.configure_column("order_id", header_name="订单号", width=140)
+    order_id_style = None
+    if "_reimbursed" in df.columns:
+        order_id_style = build_reimbursed_cell_style()
+    if order_id_style:
+        builder.configure_column(
+            "order_id",
+            header_name="订单号",
+            width=140,
+            cellStyle=order_id_style,
+        )
+    else:
+        builder.configure_column("order_id", header_name="订单号", width=140)
     builder.configure_column("vendor", header_name="店铺", width=160)
     builder.configure_column("description", header_name="明细", width=260)
     link_formatter, link_class, link_tooltip = build_product_link_helpers()
@@ -762,6 +1031,29 @@ def build_screenshot_status_style():
                             textAlign:'center', cursor:'pointer', borderRadius:'4px'};
                 }
                 return {};
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+def build_reimbursed_cell_style():
+    if not JS_CODE_AVAILABLE or JsCode is None:
+        return None
+    try:
+        return JsCode(
+            """
+            function(params) {
+                if (!params || !params.data || !params.data._reimbursed) {
+                    return {};
+                }
+                return {
+                    backgroundColor: '#ffedd5',
+                    color: '#9a3412',
+                    fontWeight: '700',
+                    borderRadius: '4px'
+                };
             }
             """
         )
@@ -1289,13 +1581,16 @@ def render_preprocess_tab(orders_paths, config_path):
     if st.session_state.preprocess_notice:
         st.success(st.session_state.preprocess_notice)
         st.session_state.preprocess_notice = ""
+    if st.session_state.reimbursed_notice:
+        st.success(st.session_state.reimbursed_notice)
+        st.session_state.reimbursed_notice = ""
 
     if not AGGRID_AVAILABLE:
         st.error("未安装可编辑表格组件：streamlit-aggrid")
         st.caption("安装命令：pip install streamlit-aggrid")
         return
 
-    col1, col2 = st.columns([1, 3])
+    col1, col2, col3 = st.columns([1, 2, 1.5])
     with col1:
         if st.button("解析"):
             try:
@@ -1305,9 +1600,13 @@ def render_preprocess_tab(orders_paths, config_path):
                     return
                 orders_df = matcher.load_orders_multi(orders_paths, config)
                 editor_df = orders_df_for_editor(orders_df)
+                editor_df, removed_count = deduplicate_editor_orders(editor_df)
+                notice = f"已解析 {len(editor_df)} 条"
+                if removed_count:
+                    notice += f"，自动去重 {removed_count} 条"
                 set_order_df(
                     editor_df,
-                    notice=f"已解析 {len(editor_df)} 条",
+                    notice=notice,
                     reset_grid=True,
                     reset_row_ids=True,
                 )
@@ -1315,6 +1614,29 @@ def render_preprocess_tab(orders_paths, config_path):
                 st.error(f"解析失败：{exc}")
     with col2:
         allow_edit = st.checkbox("允许编辑", value=False)
+    with col3:
+        reimbursed_upload = st.file_uploader(
+            "导入已报销订单",
+            type=["xlsx", "xls", "csv", "zip"],
+            key="preprocess_reimbursed_upload",
+        )
+        if st.button("读取已报销订单", disabled=reimbursed_upload is None):
+            try:
+                reimbursed_df = load_reimbursed_orders_file(reimbursed_upload)
+                reimbursed_matchers = collect_reimbursed_matchers(reimbursed_df)
+                reimbursed_ids = reimbursed_matchers["order_ids"]
+                reimbursed_fallback_keys = reimbursed_matchers["fallback_keys"]
+                st.session_state.reimbursed_order_ids = reimbursed_ids
+                st.session_state.reimbursed_fallback_keys = reimbursed_fallback_keys
+                st.session_state.reimbursed_source_name = reimbursed_upload.name
+                st.session_state.reimbursed_source_rows = len(reimbursed_df)
+                total_reimbursed = len(reimbursed_ids) + len(reimbursed_fallback_keys)
+                st.session_state.reimbursed_notice = (
+                    f"已导入已报销订单：{total_reimbursed} 个"
+                )
+                trigger_rerun()
+            except Exception as exc:
+                st.error(f"导入失败：{exc}")
 
     if allow_edit:
         st.caption("双击单元格编辑，点击行后可删除当前行。")
@@ -1350,7 +1672,27 @@ def render_preprocess_tab(orders_paths, config_path):
     else:
         display_base_df = current_df
 
+    reimbursed_ids = set(st.session_state.get("reimbursed_order_ids", []))
+    reimbursed_fallback_keys = set(st.session_state.get("reimbursed_fallback_keys", []))
+    reimbursed_mask_all = compute_reimbursed_mask(
+        st.session_state.order_df, reimbursed_ids, reimbursed_fallback_keys
+    )
+    reimbursed_match_count = int(reimbursed_mask_all.sum())
+    reimbursed_total = len(reimbursed_ids) + len(reimbursed_fallback_keys)
+    if reimbursed_total:
+        source_name = st.session_state.get("reimbursed_source_name") or "已导入文件"
+        st.info(
+            f"已报销订单：{reimbursed_total} 个（当前预处理命中 {reimbursed_match_count} 个）"
+        )
+        st.caption(f"来源：{source_name}")
+        if reimbursed_fallback_keys:
+            st.caption(f"其中无订单号兜底匹配：{len(reimbursed_fallback_keys)} 个")
+        st.caption("已报销订单会在“订单号”列高亮显示。")
+
     selected_row_id = st.session_state.get("preprocess_selected_row_id")
+    display_base_df = add_reimbursed_flag_column(
+        display_base_df, reimbursed_ids, reimbursed_fallback_keys
+    )
     display_df = add_auto_unique_id_column(display_base_df)
 
     grid_key = f"order_grid_{st.session_state.order_grid_version}"
@@ -1406,7 +1748,7 @@ def render_preprocess_tab(orders_paths, config_path):
             pass
         selected_ids.add(value)
 
-    action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
+    action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 1.3])
     with action_col1:
         if st.button("新增空行"):
             new_row = {
@@ -1444,6 +1786,15 @@ def render_preprocess_tab(orders_paths, config_path):
         if st.button("清空"):
             empty_df = pd.DataFrame(columns=EDITOR_COLUMNS)
             set_order_df(empty_df, notice="已清空", reset_grid=True, reset_row_ids=True)
+            trigger_rerun()
+    with action_col4:
+        if st.button("移除已报销订单", disabled=reimbursed_match_count == 0):
+            new_df = st.session_state.order_df.loc[~reimbursed_mask_all].copy()
+            set_order_df(
+                new_df,
+                notice=f"已移除 {reimbursed_match_count} 条已报销订单",
+                reset_grid=True,
+            )
             trigger_rerun()
     export_config = load_config(config_path)
     export_df = build_export_df_with_config(st.session_state.order_df, export_config)

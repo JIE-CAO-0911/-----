@@ -512,10 +512,65 @@ def load_orders_multi(orders_paths, config):
         die("Missing dependency: pandas. Install with `pip install pandas openpyxl`.")
 
     combined = pd.concat(frames, ignore_index=True)
+    combined = deduplicate_orders(combined)
     combined["_match_invoice_file"] = None
     combined["_match_invoice_id"] = None
     combined["_match_score"] = None
     return combined
+
+
+def deduplicate_orders(df):
+    if df is None or df.empty:
+        return df
+
+    try:
+        import pandas as pd
+    except ImportError:
+        return df
+
+    def series_or_default(column_name, default_value):
+        if column_name in df.columns:
+            return df[column_name]
+        return pd.Series(default_value, index=df.index)
+
+    def norm_amount(value):
+        key = amount_key(value)
+        if key is None:
+            return ""
+        return f"{key:.2f}"
+
+    def norm_date(value):
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        return ""
+
+    def norm_text(value):
+        return normalize_text(value).strip().lower()
+
+    key_df = df.copy()
+    key_df["_k_order_id"] = series_or_default("_order_id", "").apply(format_order_id)
+    key_df["_k_amount"] = series_or_default("_amount", None).apply(norm_amount)
+    key_df["_k_date"] = series_or_default("_date", None).apply(norm_date)
+    key_df["_k_vendor"] = series_or_default("_vendor", "").apply(norm_text)
+    key_df["_k_desc"] = series_or_default("_description", "").apply(norm_text)
+    key_df["_k_link"] = series_or_default("_product_link", "").apply(norm_text)
+    key_df["_k_status"] = series_or_default("_status", "").apply(norm_text)
+
+    dedupe_cols = [
+        "_k_order_id",
+        "_k_amount",
+        "_k_date",
+        "_k_vendor",
+        "_k_desc",
+        "_k_link",
+        "_k_status",
+    ]
+    duplicated = key_df.duplicated(subset=dedupe_cols, keep="first")
+    if not duplicated.any():
+        return df
+    return df.loc[~duplicated].reset_index(drop=True)
 
 
 def merge_multi_item_orders(df, config):
