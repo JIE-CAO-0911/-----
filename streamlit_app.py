@@ -173,6 +173,25 @@ REIMBURSED_VENDOR_CANDIDATES = [
     "商家",
     "卖家",
 ]
+MAIN_TAB_ITEMS = [
+    {
+        "key": "预处理",
+        "label": "订单预处理",
+        "desc": "导入订单、去重筛选、清理已报销记录",
+    },
+    {
+        "key": "匹配",
+        "label": "发票匹配核对",
+        "desc": "自动匹配订单与发票，集中复核疑似结果",
+    },
+    {
+        "key": "截图",
+        "label": "截图资料归档",
+        "desc": "补齐凭证截图并导出报销压缩包/打印版",
+    },
+]
+MAIN_TAB_LABELS = {item["key"]: item["label"] for item in MAIN_TAB_ITEMS}
+MAIN_TAB_DESCS = {item["key"]: item["desc"] for item in MAIN_TAB_ITEMS}
 
 
 def default_orders_path():
@@ -199,6 +218,105 @@ def save_config(path, config):
         st.success("已保存")
     except Exception as exc:
         st.error(f"保存失败：{exc}")
+
+
+def inject_ui_styles():
+    st.markdown(
+        """
+        <style>
+        html, body, [class*="css"] {
+            font-family: "MiSans", "PingFang SC", "Source Han Sans SC", "Microsoft YaHei", sans-serif;
+        }
+        .main .block-container {
+            max-width: 1320px;
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+        }
+        .assistant-hero {
+            background: linear-gradient(120deg, #ecfeff 0%, #eef2ff 52%, #fff7ed 100%);
+            border: 1px solid #d8e8ea;
+            border-radius: 20px;
+            padding: 18px 22px 16px 22px;
+            margin-bottom: 0.8rem;
+        }
+        .assistant-hero h1 {
+            margin: 0;
+            font-size: 2rem;
+            line-height: 1.15;
+            color: #0f2f3a;
+            letter-spacing: 0.4px;
+        }
+        .assistant-hero p {
+            margin: 8px 0 0 0;
+            color: #35515d;
+            font-size: 0.95rem;
+        }
+        div[data-testid="stSegmentedControl"] > div {
+            gap: 0.4rem;
+        }
+        div[data-testid="stSegmentedControl"] button {
+            border-radius: 999px !important;
+            border: 1px solid #cddfe2 !important;
+            font-weight: 650 !important;
+            letter-spacing: 0.2px;
+            padding: 0.35rem 0.9rem !important;
+        }
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+            background: linear-gradient(135deg, #0f766e 0%, #115e59 100%) !important;
+            color: #ffffff !important;
+            border-color: #115e59 !important;
+        }
+        div[data-testid="stMetric"] {
+            background: #f8fbfc;
+            border: 1px solid #d8e8ea;
+            border-radius: 14px;
+            padding: 0.45rem 0.75rem;
+        }
+        div[data-testid="stMetricLabel"] p {
+            font-weight: 650;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_hero():
+    st.markdown(
+        """
+        <div class="assistant-hero">
+          <h1>报销助手</h1>
+          <p>整合订单预处理、发票匹配核对、截图资料归档，减少重复操作并提升报销效率。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_main_navigation():
+    tab_keys = [item["key"] for item in MAIN_TAB_ITEMS]
+    pending_tab = st.session_state.get("pending_tab")
+    if pending_tab in tab_keys:
+        st.session_state.active_tab = pending_tab
+        st.session_state.pending_tab = None
+
+    current_tab = st.session_state.get("active_tab")
+    if current_tab not in tab_keys:
+        current_tab = tab_keys[0]
+        st.session_state.active_tab = current_tab
+
+    active_tab = st.segmented_control(
+        "主要功能",
+        options=tab_keys,
+        format_func=lambda key: MAIN_TAB_LABELS.get(key, key),
+        selection_mode="single",
+        key="active_tab",
+        label_visibility="collapsed",
+    )
+    if active_tab is None:
+        active_tab = st.session_state.get("active_tab", current_tab)
+    st.caption(MAIN_TAB_DESCS.get(active_tab, ""))
+    return active_tab
 
 
 def sync_sidebar_config_state(config_path):
@@ -1248,6 +1366,22 @@ def format_amount(value):
         return str(value)
 
 
+def compute_order_date_span(values):
+    dates = []
+    for value in values:
+        parsed = matcher.parse_date(value)
+        if parsed is not None:
+            dates.append(parsed)
+    if not dates:
+        return "无有效日期", 0
+    start_date = min(dates)
+    end_date = max(dates)
+    days = (end_date - start_date).days + 1
+    if start_date == end_date:
+        return start_date.strftime("%Y-%m-%d"), 1
+    return f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}", days
+
+
 def open_pdf_file(path):
     try:
         if os.name == "nt":
@@ -2002,7 +2136,8 @@ def export_reimbursement_print_pdf(df, export_dir):
 
 
 def render_preprocess_tab(orders_paths, config_path):
-    st.subheader("预处理")
+    st.subheader("订单预处理工作台")
+    st.caption("先读取订单并完成去重/筛选，再进入发票匹配。")
     if st.session_state.preprocess_notice:
         st.success(st.session_state.preprocess_notice)
         st.session_state.preprocess_notice = ""
@@ -2015,9 +2150,41 @@ def render_preprocess_tab(orders_paths, config_path):
         st.caption("安装命令：pip install streamlit-aggrid")
         return
 
-    col1, col2 = st.columns([1, 2.5])
-    with col1:
-        if st.button("解析"):
+    current_df = ensure_editor_df(st.session_state.order_df)
+    st.session_state.order_df = current_df
+
+    reimbursed_ids = set(st.session_state.get("reimbursed_order_ids", []))
+    reimbursed_fallback_keys = set(st.session_state.get("reimbursed_fallback_keys", []))
+    reimbursed_mask_all = compute_reimbursed_mask(
+        current_df, reimbursed_ids, reimbursed_fallback_keys
+    )
+    reimbursed_match_count = int(reimbursed_mask_all.sum())
+    reimbursed_total = len(reimbursed_ids) + len(reimbursed_fallback_keys)
+
+    total_amount = sum_amounts(current_df.get("amount", []))
+    date_span_text, span_days = compute_order_date_span(current_df.get("order_date", []))
+    vendor_count = int(
+        current_df["vendor"]
+        .fillna("")
+        .astype(str)
+        .map(lambda value: value.strip())
+        .replace("", pd.NA)
+        .dropna()
+        .nunique()
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("订单总数", f"{len(current_df)}")
+    m2.metric("时间跨度", f"{span_days} 天" if span_days else "无")
+    m3.metric("订单总金额", format_amount(total_amount))
+    m4.metric("已报销命中", f"{reimbursed_match_count}")
+    st.caption(f"日期范围：{date_span_text} ｜ 涉及店铺：{vendor_count} 家")
+
+    st.markdown("#### 1. 数据导入")
+    st.caption("读取订单文件，并可导入报销明细用于已报销订单高亮与剔除。")
+    import_col1, import_col2 = st.columns([1.1, 2.4])
+    with import_col1:
+        if st.button("读取并解析订单", key="preprocess_parse_orders", use_container_width=True):
             try:
                 config = matcher.load_config(config_path)
                 if not orders_paths:
@@ -2038,47 +2205,86 @@ def render_preprocess_tab(orders_paths, config_path):
                 )
             except Exception as exc:
                 st.error(f"解析失败：{exc}")
-    with col2:
+    with import_col2:
         reimbursed_upload = st.file_uploader(
             "导入已报销订单",
             type=["xlsx", "xls", "csv", "zip"],
             key="preprocess_reimbursed_upload",
         )
-        if st.button("读取已报销订单", disabled=reimbursed_upload is None):
-            try:
-                reimbursed_df = load_reimbursed_orders_file(reimbursed_upload)
-                reimbursed_matchers = collect_reimbursed_matchers(reimbursed_df)
-                reimbursed_ids = reimbursed_matchers["order_ids"]
-                reimbursed_fallback_keys = reimbursed_matchers["fallback_keys"]
-                st.session_state.reimbursed_order_ids = reimbursed_ids
-                st.session_state.reimbursed_fallback_keys = reimbursed_fallback_keys
-                st.session_state.reimbursed_source_name = reimbursed_upload.name
-                st.session_state.reimbursed_source_rows = len(reimbursed_df)
-                total_reimbursed = len(reimbursed_ids) + len(reimbursed_fallback_keys)
-                st.session_state.reimbursed_notice = (
-                    f"已导入已报销订单：{total_reimbursed} 个"
-                )
-                trigger_rerun()
-            except Exception as exc:
-                st.error(f"导入失败：{exc}")
+        import_action_col1, import_action_col2 = st.columns([1, 2.8])
+        with import_action_col1:
+            if st.button(
+                "读取已报销订单",
+                key="preprocess_read_reimbursed",
+                disabled=reimbursed_upload is None,
+                use_container_width=True,
+            ):
+                try:
+                    reimbursed_df = load_reimbursed_orders_file(reimbursed_upload)
+                    reimbursed_matchers = collect_reimbursed_matchers(reimbursed_df)
+                    reimbursed_ids = reimbursed_matchers["order_ids"]
+                    reimbursed_fallback_keys = reimbursed_matchers["fallback_keys"]
+                    st.session_state.reimbursed_order_ids = reimbursed_ids
+                    st.session_state.reimbursed_fallback_keys = reimbursed_fallback_keys
+                    st.session_state.reimbursed_source_name = reimbursed_upload.name
+                    st.session_state.reimbursed_source_rows = len(reimbursed_df)
+                    total_reimbursed = len(reimbursed_ids) + len(reimbursed_fallback_keys)
+                    st.session_state.reimbursed_notice = (
+                        f"已导入已报销订单：{total_reimbursed} 个"
+                    )
+                    trigger_rerun()
+                except Exception as exc:
+                    st.error(f"导入失败：{exc}")
+        with import_action_col2:
+            if reimbursed_upload is None:
+                st.caption("支持 xlsx/xls/csv/zip，zip 内会自动提取报销明细表。")
+            else:
+                st.caption(f"待导入文件：{reimbursed_upload.name}")
 
-    tools_col1, tools_col2, tools_col3, tools_col4 = st.columns([1, 1, 1, 1.2])
+    if reimbursed_total:
+        source_name = st.session_state.get("reimbursed_source_name") or "已导入文件"
+        st.info(
+            f"已报销订单：{reimbursed_total} 个（当前预处理命中 {reimbursed_match_count} 个）"
+        )
+        st.caption(f"来源：{source_name}")
+        if reimbursed_fallback_keys:
+            st.caption(f"其中无订单号兜底匹配：{len(reimbursed_fallback_keys)} 个")
+        st.caption("已报销订单会在“订单号”列高亮显示。")
+
+    st.markdown("#### 2. 编辑与缓存")
+    st.caption("支持自动保存与最多 20 步撤回/重做，确保预处理过程可回退。")
+    undo_count = len(st.session_state.get("preprocess_undo_stack", []))
+    redo_count = len(st.session_state.get("preprocess_redo_stack", []))
+    tools_col1, tools_col2, tools_col3, tools_col4 = st.columns([1.2, 1, 1, 1.2])
     with tools_col1:
-        if st.button("暂存", disabled=bool(st.session_state.get("preprocess_auto_save"))):
+        if st.button(
+            "暂存",
+            key="preprocess_manual_cache",
+            use_container_width=True,
+            disabled=bool(st.session_state.get("preprocess_auto_save")),
+        ):
             try:
                 save_preprocess_cache()
                 st.session_state.preprocess_notice = "暂存成功"
                 trigger_rerun()
             except Exception as exc:
                 st.error(f"暂存失败：{exc}")
-    undo_count = len(st.session_state.get("preprocess_undo_stack", []))
-    redo_count = len(st.session_state.get("preprocess_redo_stack", []))
     with tools_col2:
-        if st.button("撤回", disabled=undo_count == 0):
+        if st.button(
+            "撤回",
+            key="preprocess_undo_action",
+            use_container_width=True,
+            disabled=undo_count == 0,
+        ):
             if undo_preprocess_change():
                 trigger_rerun()
     with tools_col3:
-        if st.button("重做", disabled=redo_count == 0):
+        if st.button(
+            "重做",
+            key="preprocess_redo_action",
+            use_container_width=True,
+            disabled=redo_count == 0,
+        ):
             if redo_preprocess_change():
                 trigger_rerun()
     with tools_col4:
@@ -2091,12 +2297,10 @@ def render_preprocess_tab(orders_paths, config_path):
         f"撤回/重做最多保留 {PREPROCESS_HISTORY_LIMIT} 步：可撤回 {undo_count}，可重做 {redo_count}"
     )
     if st.session_state.get("preprocess_auto_save"):
-        st.caption("自动保存已开启，已禁用手动“暂存”按钮。")
+        st.caption("自动保存已开启，手动“暂存”按钮已禁用。")
 
-    st.caption("双击单元格编辑，点击行后可删除当前行。")
-
-    current_df = ensure_editor_df(st.session_state.order_df)
-    st.session_state.order_df = current_df
+    st.markdown("#### 3. 预处理订单表格")
+    filter_col, hint_col = st.columns([2.4, 1.6])
     status_options = [
         value
         for value in sorted(
@@ -2107,15 +2311,19 @@ def render_preprocess_tab(orders_paths, config_path):
             }
         )
     ]
-    if status_options:
-        selected_statuses = st.multiselect(
-            "状态筛选",
-            options=status_options,
-            default=status_options,
-            key="order_status_filter",
-        )
-    else:
-        selected_statuses = []
+    with filter_col:
+        if status_options:
+            selected_statuses = st.multiselect(
+                "状态筛选",
+                options=status_options,
+                default=status_options,
+                key="order_status_filter",
+            )
+        else:
+            selected_statuses = []
+            st.caption("当前无状态字段内容，默认展示全部订单。")
+    with hint_col:
+        st.caption("双击单元格可编辑；勾选行后可批量删除。")
 
     if status_options and selected_statuses:
         display_base_df = current_df[current_df["order_status"].isin(selected_statuses)]
@@ -2123,23 +2331,6 @@ def render_preprocess_tab(orders_paths, config_path):
         display_base_df = current_df.iloc[0:0]
     else:
         display_base_df = current_df
-
-    reimbursed_ids = set(st.session_state.get("reimbursed_order_ids", []))
-    reimbursed_fallback_keys = set(st.session_state.get("reimbursed_fallback_keys", []))
-    reimbursed_mask_all = compute_reimbursed_mask(
-        st.session_state.order_df, reimbursed_ids, reimbursed_fallback_keys
-    )
-    reimbursed_match_count = int(reimbursed_mask_all.sum())
-    reimbursed_total = len(reimbursed_ids) + len(reimbursed_fallback_keys)
-    if reimbursed_total:
-        source_name = st.session_state.get("reimbursed_source_name") or "已导入文件"
-        st.info(
-            f"已报销订单：{reimbursed_total} 个（当前预处理命中 {reimbursed_match_count} 个）"
-        )
-        st.caption(f"来源：{source_name}")
-        if reimbursed_fallback_keys:
-            st.caption(f"其中无订单号兜底匹配：{len(reimbursed_fallback_keys)} 个")
-        st.caption("已报销订单会在“订单号”列高亮显示。")
 
     selected_row_id = st.session_state.get("preprocess_selected_row_id")
     display_base_df = add_reimbursed_flag_column(
@@ -2205,9 +2396,11 @@ def render_preprocess_tab(orders_paths, config_path):
             pass
         selected_ids.add(value)
 
-    action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 1.3])
+    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(
+        [1, 1, 1, 1.3, 1.8]
+    )
     with action_col1:
-        if st.button("新增空行"):
+        if st.button("新增空行", key="preprocess_add_blank", use_container_width=True):
             next_row_id = st.session_state.order_row_id_seq
             new_row = {
                 "order_id": "",
@@ -2232,7 +2425,7 @@ def render_preprocess_tab(orders_paths, config_path):
             )
             trigger_rerun()
     with action_col2:
-        if st.button("删除选中"):
+        if st.button("删除选中", key="preprocess_delete_selected", use_container_width=True):
             if not selected_ids:
                 st.warning("请先勾选要删除的订单")
             else:
@@ -2247,7 +2440,7 @@ def render_preprocess_tab(orders_paths, config_path):
                 )
                 trigger_rerun()
     with action_col3:
-        if st.button("清空"):
+        if st.button("清空", key="preprocess_clear_all", use_container_width=True):
             empty_df = pd.DataFrame(columns=EDITOR_COLUMNS)
             apply_preprocess_change(
                 empty_df,
@@ -2258,7 +2451,12 @@ def render_preprocess_tab(orders_paths, config_path):
             )
             trigger_rerun()
     with action_col4:
-        if st.button("移除已报销订单", disabled=reimbursed_match_count == 0):
+        if st.button(
+            "移除已报销订单",
+            key="preprocess_remove_reimbursed",
+            use_container_width=True,
+            disabled=reimbursed_match_count == 0,
+        ):
             new_df = st.session_state.order_df.loc[~reimbursed_mask_all].copy()
             apply_preprocess_change(
                 new_df,
@@ -2267,54 +2465,77 @@ def render_preprocess_tab(orders_paths, config_path):
                 track_history=True,
             )
             trigger_rerun()
-    export_config = load_config(config_path)
-    export_df = build_export_df_with_config(st.session_state.order_df, export_config)
-    export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
-    with export_col1:
-        csv_data = export_df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button(
-            "导出 CSV",
-            data=csv_data,
-            file_name="订单预筛选.csv",
-            mime="text/csv",
-            disabled=export_df.empty,
-        )
-    with export_col2:
-        if st.button("导出 Excel(另存为)"):
-            if export_df.empty:
-                st.warning("没有可导出的数据")
-            else:
-                save_path = select_export_path("订单预筛选.xlsx")
-                if save_path:
-                    if not save_path.lower().endswith(".xlsx"):
-                        save_path += ".xlsx"
-                    try:
-                        export_df.to_excel(save_path, index=False, sheet_name="orders")
-                        st.success(f"已导出：{save_path}")
-                    except Exception as exc:
-                        st.warning(f"导出 Excel 失败：{exc}")
-        if not TK_AVAILABLE:
-            if export_df.empty:
-                st.download_button("导出 Excel", data=b"", file_name="订单预筛选.xlsx", disabled=True)
-            else:
-                try:
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                        export_df.to_excel(writer, index=False, sheet_name="orders")
+    with action_col5:
+        if st.button(
+            "开始发票匹配",
+            key="preprocess_start_match",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.order_df is None or st.session_state.order_df.empty,
+        ):
+            st.session_state.pending_tab = "匹配"
+            st.session_state.pending_match_auto_start = True
+            trigger_rerun()
+
+    tool_tab_export, tool_tab_add = st.tabs(["导出预处理结果", "快速新增订单"])
+    with tool_tab_export:
+        export_config = load_config(config_path)
+        export_df = build_export_df_with_config(st.session_state.order_df, export_config)
+        export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
+        with export_col1:
+            csv_data = export_df.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "导出 CSV",
+                data=csv_data,
+                file_name="订单预筛选.csv",
+                mime="text/csv",
+                disabled=export_df.empty,
+                use_container_width=True,
+            )
+        with export_col2:
+            if st.button("导出 Excel(另存为)", key="preprocess_export_excel_dialog", use_container_width=True):
+                if export_df.empty:
+                    st.warning("没有可导出的数据")
+                else:
+                    save_path = select_export_path("订单预筛选.xlsx")
+                    if save_path:
+                        if not save_path.lower().endswith(".xlsx"):
+                            save_path += ".xlsx"
+                        try:
+                            export_df.to_excel(save_path, index=False, sheet_name="orders")
+                            st.success(f"已导出：{save_path}")
+                        except Exception as exc:
+                            st.warning(f"导出 Excel 失败：{exc}")
+            if not TK_AVAILABLE:
+                if export_df.empty:
                     st.download_button(
                         "导出 Excel",
-                        data=buffer.getvalue(),
+                        data=b"",
                         file_name="订单预筛选.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        disabled=True,
+                        use_container_width=True,
                     )
-                except Exception as exc:
-                    st.warning(f"导出 Excel 失败：{exc}")
-    with export_col3:
-        st.caption(f"当前 {len(export_df)} 行")
-        total_amount = sum_amounts(st.session_state.order_df.get("amount", []))
-        st.caption(f"订单总金额：{format_amount(total_amount)}")
+                else:
+                    try:
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                            export_df.to_excel(writer, index=False, sheet_name="orders")
+                        st.download_button(
+                            "导出 Excel",
+                            data=buffer.getvalue(),
+                            file_name="订单预筛选.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                    except Exception as exc:
+                        st.warning(f"导出 Excel 失败：{exc}")
+        with export_col3:
+            st.caption(f"当前 {len(export_df)} 行")
+            total_export_amount = sum_amounts(st.session_state.order_df.get("amount", []))
+            st.caption(f"订单总金额：{format_amount(total_export_amount)}")
 
-    with st.expander("新增"):
+    with tool_tab_add:
+        st.caption("手工补录单条订单信息，提交后会进入预处理表格。")
         new_cols = st.columns(3)
         with new_cols[0]:
             new_order_id = st.text_input("订单号", key="new_order_id")
@@ -2327,7 +2548,7 @@ def render_preprocess_tab(orders_paths, config_path):
             new_date = st.text_input("时间", key="new_date")
             new_link = st.text_input("商品链接", key="new_link")
 
-        if st.button("添加"):
+        if st.button("添加订单", key="preprocess_add_order", type="secondary"):
             amount_value = matcher.parse_amount(new_amount) if new_amount else None
             next_row_id = st.session_state.order_row_id_seq
             new_row = {
@@ -2353,25 +2574,15 @@ def render_preprocess_tab(orders_paths, config_path):
             )
             trigger_rerun()
 
-    st.divider()
-    if st.button(
-        "开始发票匹配",
-        key="preprocess_start_match",
-        disabled=st.session_state.order_df is None or st.session_state.order_df.empty,
-    ):
-        st.session_state.pending_tab = "匹配"
-        st.session_state.pending_match_auto_start = True
-        trigger_rerun()
-
 
 def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive, color_map):
-    st.subheader("匹配")
+    st.subheader("发票匹配与复核")
     orders_hint = f"{len(orders_paths)} 个文件" if orders_paths else "未选择"
     st.caption(f"订单：{orders_hint} ｜ 发票：{pdf_dir}")
     matched_orders_for_screenshots = pd.DataFrame()
 
     auto_start_match = bool(st.session_state.pop("pending_match_auto_start", False))
-    if st.button("开始") or auto_start_match:
+    if st.button("开始匹配") or auto_start_match:
         config = load_config(config_path)
         try:
             backend = matcher.resolve_pdf_backend()
@@ -2618,7 +2829,7 @@ def prepare_screenshot_orders_df(df):
 
 
 def render_screenshot_tab():
-    st.subheader("截图管理")
+    st.subheader("截图资料归档")
     if st.session_state.get("screenshot_notice"):
         st.success(st.session_state.screenshot_notice)
         st.session_state.screenshot_notice = ""
@@ -2791,14 +3002,14 @@ def render_screenshot_tab():
 
 
 def main():
-    st.set_page_config(page_title="发票匹配", layout="wide")
+    st.set_page_config(page_title="报销助手", layout="wide")
     ensure_session_state()
     start_auto_shutdown_monitor()
-
-    st.title("发票匹配")
+    inject_ui_styles()
+    render_page_hero()
 
     with st.sidebar:
-        st.header("文件")
+        st.header("文件与路径")
         select_col1, select_col2 = st.columns([1, 3])
         with select_col1:
             if st.button("选订单"):
@@ -2819,7 +3030,7 @@ def main():
 
         recursive = st.checkbox("递归扫描", value=False)
 
-        with st.expander("设置", expanded=True):
+        with st.expander("全局设置", expanded=True):
             st.text_input("配置文件", key="config_path")
             render_sidebar_settings(st.session_state.config_path)
             st.subheader("颜色")
@@ -2838,22 +3049,7 @@ def main():
         "无匹配": st.session_state.color_nomatch,
     }
 
-    tab_labels = ["预处理", "匹配", "截图"]
-    pending_tab = st.session_state.get("pending_tab")
-    if pending_tab in tab_labels:
-        st.session_state.active_tab = pending_tab
-        st.session_state.pending_tab = None
-    current_tab = st.session_state.get("active_tab", tab_labels[0])
-    if current_tab not in tab_labels:
-        current_tab = tab_labels[0]
-    active_tab = st.radio(
-        "导航",
-        tab_labels,
-        index=tab_labels.index(current_tab),
-        horizontal=True,
-        label_visibility="collapsed",
-        key="active_tab",
-    )
+    active_tab = render_main_navigation()
 
     if active_tab == "预处理":
         render_preprocess_tab(orders_paths, config_path)
