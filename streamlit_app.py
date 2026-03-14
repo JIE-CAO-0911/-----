@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import html
 import io
 import json
 import os
@@ -275,6 +276,50 @@ def inject_ui_styles():
         div[data-testid="stMetricLabel"] p {
             font-weight: 650;
         }
+        .date-span-card {
+            background: #f8fbfc;
+            border: 1px solid #d8e8ea;
+            border-radius: 14px;
+            padding: 0.46rem 0.75rem 0.5rem 0.75rem;
+            min-height: 96px;
+        }
+        .date-span-label {
+            color: #2d3f47;
+            font-weight: 650;
+            font-size: 0.88rem;
+            line-height: 1.2;
+            margin-bottom: 0.3rem;
+        }
+        .date-span-row {
+            display: flex;
+            align-items: baseline;
+            gap: 0.42rem;
+            margin: 0.1rem 0;
+        }
+        .date-span-sub {
+            color: #5b6d75;
+            font-weight: 650;
+            font-size: 0.78rem;
+            letter-spacing: 0.2px;
+            min-width: 2rem;
+        }
+        .date-span-line {
+            color: #12222c;
+            font-weight: 650;
+            font-size: 1.08rem;
+            line-height: 1.32;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .import-divider {
+            width: 1px;
+            min-height: 198px;
+            height: 100%;
+            background: linear-gradient(180deg, #dce7ea 0%, #cfdde2 100%);
+            margin: 0 auto;
+            border-radius: 999px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -422,6 +467,8 @@ def ensure_session_state():
         st.session_state.orders_paths_text = default_orders_path()
     if "pdf_dir" not in st.session_state:
         st.session_state.pdf_dir = r"D:\发票\报销中"
+    if "recursive_scan" not in st.session_state:
+        st.session_state.recursive_scan = False
     if "config_path" not in st.session_state:
         st.session_state.config_path = str(DEFAULT_CONFIG_PATH)
     if "output_path" not in st.session_state:
@@ -1382,6 +1429,47 @@ def compute_order_date_span(values):
     return f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}", days
 
 
+def render_date_span_card(date_span_text):
+    text = str(date_span_text or "").strip()
+    if " ~ " in text:
+        start_text, end_text = text.split(" ~ ", 1)
+    elif "~" in text:
+        start_text, end_text = text.split("~", 1)
+        start_text = start_text.strip()
+        end_text = end_text.strip()
+    else:
+        start_text, end_text = text, ""
+
+    start_safe = html.escape(start_text or "-")
+    end_safe = html.escape(end_text or "")
+    if end_safe:
+        content_html = (
+            '<div class="date-span-row">'
+            '<span class="date-span-sub">最早</span>'
+            f'<span class="date-span-line">{start_safe}</span>'
+            "</div>"
+            '<div class="date-span-row">'
+            '<span class="date-span-sub">最晚</span>'
+            f'<span class="date-span-line">{end_safe}</span>'
+            "</div>"
+        )
+    else:
+        content_html = (
+            '<div class="date-span-row">'
+            f'<span class="date-span-line">{start_safe}</span>'
+            "</div>"
+        )
+    st.markdown(
+        f"""
+        <div class="date-span-card">
+          <div class="date-span-label">时间跨度</div>
+          {content_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def open_pdf_file(path):
     try:
         if os.name == "nt":
@@ -2162,7 +2250,7 @@ def render_preprocess_tab(orders_paths, config_path):
     reimbursed_total = len(reimbursed_ids) + len(reimbursed_fallback_keys)
 
     total_amount = sum_amounts(current_df.get("amount", []))
-    date_span_text, span_days = compute_order_date_span(current_df.get("order_date", []))
+    date_span_text, _span_days = compute_order_date_span(current_df.get("order_date", []))
     vendor_count = int(
         current_df["vendor"]
         .fillna("")
@@ -2175,44 +2263,71 @@ def render_preprocess_tab(orders_paths, config_path):
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("订单总数", f"{len(current_df)}")
-    m2.metric("时间跨度", f"{span_days} 天" if span_days else "无")
+    with m2:
+        render_date_span_card(date_span_text)
     m3.metric("订单总金额", format_amount(total_amount))
     m4.metric("已报销命中", f"{reimbursed_match_count}")
-    st.caption(f"日期范围：{date_span_text} ｜ 涉及店铺：{vendor_count} 家")
+    st.caption(f"涉及店铺：{vendor_count} 家")
 
     st.markdown("#### 1. 数据导入")
-    st.caption("读取订单文件，并可导入报销明细用于已报销订单高亮与剔除。")
-    import_col1, import_col2 = st.columns([1.1, 2.4])
-    with import_col1:
-        if st.button("读取并解析订单", key="preprocess_parse_orders", use_container_width=True):
-            try:
-                config = matcher.load_config(config_path)
-                if not orders_paths:
-                    st.error("请选择订单文件")
-                    return
-                orders_df = matcher.load_orders_multi(orders_paths, config)
-                editor_df = orders_df_for_editor(orders_df)
-                editor_df, removed_count = deduplicate_editor_orders(editor_df)
-                notice = f"已解析 {len(editor_df)} 条"
-                if removed_count:
-                    notice += f"，自动去重 {removed_count} 条"
-                apply_preprocess_change(
-                    editor_df,
-                    notice=notice,
-                    reset_grid=True,
-                    reset_row_ids=True,
-                    track_history=True,
-                )
-            except Exception as exc:
-                st.error(f"解析失败：{exc}")
-    with import_col2:
-        reimbursed_upload = st.file_uploader(
-            "导入已报销订单",
-            type=["xlsx", "xls", "csv", "zip"],
-            key="preprocess_reimbursed_upload",
-        )
-        import_action_col1, import_action_col2 = st.columns([1, 2.8])
-        with import_action_col1:
+    st.caption("左侧导入订单/发票并解析，右侧单独导入已报销明细。")
+    import_left_col, import_divider_col, import_right_col = st.columns([1.35, 0.05, 1.1])
+    with import_left_col:
+        with st.container(border=True):
+            st.markdown("##### 订单与发票")
+            select_col1, select_col2 = st.columns([1, 3])
+            with select_col1:
+                if st.button("选订单", key="preprocess_pick_orders"):
+                    chosen = select_order_files()
+                    if chosen:
+                        st.session_state.orders_paths_text = "\n".join(chosen)
+            with select_col2:
+                st.text_area("订单文件(多选)", key="orders_paths_text", height=86)
+
+            select_col3, select_col4 = st.columns([1, 3])
+            with select_col3:
+                if st.button("选发票", key="preprocess_pick_pdfs"):
+                    chosen = select_pdf_folder()
+                    if chosen:
+                        st.session_state.pdf_dir = chosen
+            with select_col4:
+                st.text_input("发票文件夹", key="pdf_dir")
+
+            st.checkbox("递归扫描发票目录", key="recursive_scan")
+
+            current_orders_paths = parse_orders_paths(st.session_state.orders_paths_text)
+            if st.button("读取并解析订单", key="preprocess_parse_orders", use_container_width=True):
+                try:
+                    config = matcher.load_config(config_path)
+                    if not current_orders_paths:
+                        st.error("请选择订单文件")
+                        return
+                    orders_df = matcher.load_orders_multi(current_orders_paths, config)
+                    editor_df = orders_df_for_editor(orders_df)
+                    editor_df, removed_count = deduplicate_editor_orders(editor_df)
+                    notice = f"已解析 {len(editor_df)} 条"
+                    if removed_count:
+                        notice += f"，自动去重 {removed_count} 条"
+                    apply_preprocess_change(
+                        editor_df,
+                        notice=notice,
+                        reset_grid=True,
+                        reset_row_ids=True,
+                        track_history=True,
+                    )
+                except Exception as exc:
+                    st.error(f"解析失败：{exc}")
+    with import_divider_col:
+        st.markdown('<div class="import-divider"></div>', unsafe_allow_html=True)
+    with import_right_col:
+        with st.container(border=True):
+            st.markdown("##### 导入已报销订单")
+            st.caption("支持 xlsx/xls/csv/zip，zip 内会自动提取报销明细表。")
+            reimbursed_upload = st.file_uploader(
+                "选择报销明细文件",
+                type=["xlsx", "xls", "csv", "zip"],
+                key="preprocess_reimbursed_upload",
+            )
             if st.button(
                 "读取已报销订单",
                 key="preprocess_read_reimbursed",
@@ -2235,11 +2350,8 @@ def render_preprocess_tab(orders_paths, config_path):
                     trigger_rerun()
                 except Exception as exc:
                     st.error(f"导入失败：{exc}")
-        with import_action_col2:
-            if reimbursed_upload is None:
-                st.caption("支持 xlsx/xls/csv/zip，zip 内会自动提取报销明细表。")
-            else:
-                st.caption(f"待导入文件：{reimbursed_upload.name}")
+            if reimbursed_upload is not None:
+                st.caption(f"已选择：{reimbursed_upload.name}")
 
     if reimbursed_total:
         source_name = st.session_state.get("reimbursed_source_name") or "已导入文件"
@@ -2396,35 +2508,10 @@ def render_preprocess_tab(orders_paths, config_path):
             pass
         selected_ids.add(value)
 
-    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(
-        [1, 1, 1, 1.3, 1.8]
+    action_col1, action_col2, action_col3, action_col4 = st.columns(
+        [1, 1, 1.3, 1.8]
     )
     with action_col1:
-        if st.button("新增空行", key="preprocess_add_blank", use_container_width=True):
-            next_row_id = st.session_state.order_row_id_seq
-            new_row = {
-                "order_id": "",
-                "vendor": "",
-                "description": "",
-                "product_link": "",
-                "amount": None,
-                "order_status": "",
-                "order_date": "",
-                "_row_id": next_row_id,
-            }
-            new_df = pd.concat(
-                [st.session_state.order_df, pd.DataFrame([new_row])],
-                ignore_index=True,
-            )
-            apply_preprocess_change(
-                new_df,
-                notice="已新增空行",
-                reset_grid=True,
-                reset_row_ids=False,
-                track_history=True,
-            )
-            trigger_rerun()
-    with action_col2:
         if st.button("删除选中", key="preprocess_delete_selected", use_container_width=True):
             if not selected_ids:
                 st.warning("请先勾选要删除的订单")
@@ -2439,7 +2526,7 @@ def render_preprocess_tab(orders_paths, config_path):
                     track_history=True,
                 )
                 trigger_rerun()
-    with action_col3:
+    with action_col2:
         if st.button("清空", key="preprocess_clear_all", use_container_width=True):
             empty_df = pd.DataFrame(columns=EDITOR_COLUMNS)
             apply_preprocess_change(
@@ -2450,7 +2537,7 @@ def render_preprocess_tab(orders_paths, config_path):
                 track_history=True,
             )
             trigger_rerun()
-    with action_col4:
+    with action_col3:
         if st.button(
             "移除已报销订单",
             key="preprocess_remove_reimbursed",
@@ -2465,7 +2552,7 @@ def render_preprocess_tab(orders_paths, config_path):
                 track_history=True,
             )
             trigger_rerun()
-    with action_col5:
+    with action_col4:
         if st.button(
             "开始发票匹配",
             key="preprocess_start_match",
@@ -3002,34 +3089,18 @@ def render_screenshot_tab():
 
 
 def main():
-    st.set_page_config(page_title="报销助手", layout="wide")
+    st.set_page_config(
+        page_title="报销助手",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     ensure_session_state()
     start_auto_shutdown_monitor()
     inject_ui_styles()
     render_page_hero()
 
     with st.sidebar:
-        st.header("文件与路径")
-        select_col1, select_col2 = st.columns([1, 3])
-        with select_col1:
-            if st.button("选订单"):
-                chosen = select_order_files()
-                if chosen:
-                    st.session_state.orders_paths_text = "\n".join(chosen)
-        with select_col2:
-            st.text_area("订单文件(多选)", key="orders_paths_text", height=80)
-
-        select_col3, select_col4 = st.columns([1, 3])
-        with select_col3:
-            if st.button("选发票"):
-                chosen = select_pdf_folder()
-                if chosen:
-                    st.session_state.pdf_dir = chosen
-        with select_col4:
-            st.text_input("发票文件夹", key="pdf_dir")
-
-        recursive = st.checkbox("递归扫描", value=False)
-
+        st.header("设置")
         with st.expander("全局设置", expanded=True):
             st.text_input("配置文件", key="config_path")
             render_sidebar_settings(st.session_state.config_path)
@@ -3040,6 +3111,7 @@ def main():
 
     orders_paths = parse_orders_paths(st.session_state.orders_paths_text)
     pdf_dir = st.session_state.pdf_dir
+    recursive = bool(st.session_state.get("recursive_scan", False))
     config_path = st.session_state.config_path
     output_path = st.session_state.output_path
 

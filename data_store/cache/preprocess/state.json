@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": "2026-03-14 16:14:56",
+  "saved_at": "2026-03-14 19:28:58",
   "snapshot": {
     "rows": [
       {
@@ -372,8 +372,28 @@
         "order_status": "交易成功",
         "order_date": "2026-01-26",
         "_row_id": 37
+      },
+      {
+        "order_id": "",
+        "vendor": "",
+        "description": "",
+        "product_link": "",
+        "amount": null,
+        "order_status": "",
+        "order_date": "",
+        "_row_id": 38
+      },
+      {
+        "order_id": "",
+        "vendor": "",
+        "description": "",
+        "product_link": "",
+        "amount": null,
+        "order_status": "",
+        "order_date": "",
+        "_row_id": 39
       }
     ],
-    "row_id_seq": 38
+    "row_id_seq": 40
   }
 }
