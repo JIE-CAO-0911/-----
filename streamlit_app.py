@@ -73,6 +73,8 @@ DEFAULT_ORDER_FILES = ["订单数据.xlsx", "订单数据 (1).xlsx"]
 AUTO_SHUTDOWN_IDLE_SECONDS = 1
 AUTO_SHUTDOWN_CHECK_SECONDS = 0.5
 AUTO_SHUTDOWN_STARTED = False
+PREPROCESS_CACHE_PATH = APP_DIR / "preprocess_cache.json"
+PREPROCESS_HISTORY_LIMIT = 20
 GRID_CUSTOM_CSS = {
     ".ag-cell.product-link-cell": {
         "background-color": "#eef2ff",
@@ -192,17 +194,7 @@ def save_config(path, config):
 
 def ensure_session_state():
     if "order_df" not in st.session_state:
-        st.session_state.order_df = pd.DataFrame(
-            columns=[
-                "order_id",
-                "vendor",
-                "description",
-                "product_link",
-                "amount",
-                "order_status",
-                "order_date",
-            ]
-        )
+        st.session_state.order_df = pd.DataFrame(columns=EDITOR_COLUMNS)
     shots.init_session_state()
     if "order_row_id_seq" not in st.session_state:
         st.session_state.order_row_id_seq = 1
@@ -242,12 +234,31 @@ def ensure_session_state():
         st.session_state.reimbursed_source_name = ""
     if "reimbursed_source_rows" not in st.session_state:
         st.session_state.reimbursed_source_rows = 0
+    if "preprocess_auto_save" not in st.session_state:
+        st.session_state.preprocess_auto_save = True
+    if "preprocess_undo_stack" not in st.session_state:
+        st.session_state.preprocess_undo_stack = []
+    if "preprocess_redo_stack" not in st.session_state:
+        st.session_state.preprocess_redo_stack = []
+    if "preprocess_cache_loaded" not in st.session_state:
+        st.session_state.preprocess_cache_loaded = False
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = "预处理"
     if "screenshot_prefill_df" not in st.session_state:
         st.session_state.screenshot_prefill_df = None
     if "pending_tab" not in st.session_state:
         st.session_state.pending_tab = None
+    if not st.session_state.preprocess_cache_loaded:
+        snapshot = load_preprocess_cache()
+        if snapshot is not None:
+            restore_preprocess_snapshot(
+                snapshot,
+                notice=f"已恢复暂存数据（{len(snapshot.get('rows', []))} 条）",
+                reset_grid=True,
+            )
+            st.session_state.preprocess_undo_stack = []
+            st.session_state.preprocess_redo_stack = []
+        st.session_state.preprocess_cache_loaded = True
 
 
 def orders_df_for_editor(orders_df):
@@ -402,7 +413,8 @@ def add_reimbursed_flag_column(df, reimbursed_order_ids, reimbursed_fallback_key
     mask = compute_reimbursed_mask(
         display_df, reimbursed_order_ids, reimbursed_fallback_keys
     )
-    display_df.insert(0, "_reimbursed", mask.values)
+    # Keep helper column at the end so AgGrid checkbox column stays visible.
+    display_df["_reimbursed"] = mask.values
     return display_df
 
 
@@ -574,6 +586,188 @@ def set_order_df(df, notice=None, reset_grid=False, reset_row_ids=False):
         st.session_state.order_grid_version += 1
     if notice:
         st.session_state.preprocess_notice = notice
+
+
+def serialize_preprocess_value(value):
+    if isinstance(value, (datetime, date)):
+        return format_editor_date(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def snapshot_from_order_df(df=None, row_id_seq=None):
+    if df is None:
+        df = st.session_state.get("order_df")
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(columns=EDITOR_COLUMNS)
+    working = df.copy()
+    for col in EDITOR_COLUMNS:
+        if col not in working.columns:
+            working[col] = None
+    working = working[EDITOR_COLUMNS]
+    working["order_date"] = working["order_date"].apply(format_editor_date)
+
+    rows = []
+    for record in working.to_dict("records"):
+        rows.append({k: serialize_preprocess_value(v) for k, v in record.items()})
+
+    if row_id_seq is None:
+        row_id_seq = st.session_state.get("order_row_id_seq", 1)
+    try:
+        row_id_seq_value = int(row_id_seq)
+    except Exception:
+        row_id_seq_value = 1
+
+    return {"rows": rows, "row_id_seq": row_id_seq_value}
+
+
+def snapshots_equal(left, right):
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return (
+        int(left.get("row_id_seq", 1)) == int(right.get("row_id_seq", 1))
+        and left.get("rows", []) == right.get("rows", [])
+    )
+
+
+def trim_history(stack):
+    if len(stack) > PREPROCESS_HISTORY_LIMIT:
+        del stack[: len(stack) - PREPROCESS_HISTORY_LIMIT]
+
+
+def save_preprocess_cache(snapshot=None):
+    if snapshot is None:
+        snapshot = snapshot_from_order_df()
+    payload = {
+        "version": 1,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "snapshot": snapshot,
+    }
+    with open(PREPROCESS_CACHE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return PREPROCESS_CACHE_PATH
+
+
+def load_preprocess_cache():
+    if not PREPROCESS_CACHE_PATH.exists():
+        return None
+    try:
+        with open(PREPROCESS_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list):
+        return None
+    row_id_seq = snapshot.get("row_id_seq", 1)
+    try:
+        row_id_seq = int(row_id_seq)
+    except Exception:
+        row_id_seq = 1
+    return {"rows": rows, "row_id_seq": row_id_seq}
+
+
+def restore_preprocess_snapshot(snapshot, notice=None, reset_grid=True):
+    rows = snapshot.get("rows", []) if isinstance(snapshot, dict) else []
+    row_id_seq = snapshot.get("row_id_seq", 1) if isinstance(snapshot, dict) else 1
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=EDITOR_COLUMNS)
+    set_order_df(df, notice=notice, reset_grid=reset_grid, reset_row_ids=True)
+    try:
+        row_id_seq_value = int(row_id_seq)
+    except Exception:
+        row_id_seq_value = st.session_state.get("order_row_id_seq", 1)
+    st.session_state.order_row_id_seq = max(
+        st.session_state.get("order_row_id_seq", 1), row_id_seq_value
+    )
+
+
+def maybe_auto_save_preprocess(force=False):
+    if not force and not st.session_state.get("preprocess_auto_save", False):
+        return
+    try:
+        save_preprocess_cache()
+    except Exception as exc:
+        st.session_state.preprocess_notice = f"自动保存失败：{exc}"
+
+
+def on_preprocess_auto_save_toggle():
+    if st.session_state.get("preprocess_auto_save", False):
+        maybe_auto_save_preprocess(force=True)
+
+
+def apply_preprocess_change(
+    new_df,
+    notice=None,
+    reset_grid=False,
+    reset_row_ids=False,
+    track_history=True,
+    force_save=False,
+):
+    before = snapshot_from_order_df()
+    set_order_df(new_df, notice=notice, reset_grid=reset_grid, reset_row_ids=reset_row_ids)
+    after = snapshot_from_order_df()
+    changed = not snapshots_equal(before, after)
+
+    if track_history and changed:
+        undo_stack = st.session_state.get("preprocess_undo_stack", [])
+        undo_stack.append(before)
+        trim_history(undo_stack)
+        st.session_state.preprocess_undo_stack = undo_stack
+        st.session_state.preprocess_redo_stack = []
+
+    if changed:
+        maybe_auto_save_preprocess(force=force_save)
+    elif force_save:
+        maybe_auto_save_preprocess(force=True)
+
+    return changed
+
+
+def undo_preprocess_change():
+    undo_stack = st.session_state.get("preprocess_undo_stack", [])
+    if not undo_stack:
+        return False
+
+    snapshot = undo_stack.pop()
+    st.session_state.preprocess_undo_stack = undo_stack
+
+    redo_stack = st.session_state.get("preprocess_redo_stack", [])
+    redo_stack.append(snapshot_from_order_df())
+    trim_history(redo_stack)
+    st.session_state.preprocess_redo_stack = redo_stack
+
+    restore_preprocess_snapshot(snapshot, notice="已撤回", reset_grid=True)
+    maybe_auto_save_preprocess()
+    return True
+
+
+def redo_preprocess_change():
+    redo_stack = st.session_state.get("preprocess_redo_stack", [])
+    if not redo_stack:
+        return False
+
+    snapshot = redo_stack.pop()
+    st.session_state.preprocess_redo_stack = redo_stack
+
+    undo_stack = st.session_state.get("preprocess_undo_stack", [])
+    undo_stack.append(snapshot_from_order_df())
+    trim_history(undo_stack)
+    st.session_state.preprocess_undo_stack = undo_stack
+
+    restore_preprocess_snapshot(snapshot, notice="已重做", reset_grid=True)
+    maybe_auto_save_preprocess()
+    return True
 
 
 def trigger_rerun():
@@ -903,9 +1097,19 @@ def build_order_grid_options(
             header_name="订单号",
             width=140,
             cellStyle=order_id_style,
+            checkboxSelection=bool(use_checkbox),
+            headerCheckboxSelection=bool(use_checkbox and header_checkbox),
+            headerCheckboxSelectionFilteredOnly=False,
         )
     else:
-        builder.configure_column("order_id", header_name="订单号", width=140)
+        builder.configure_column(
+            "order_id",
+            header_name="订单号",
+            width=140,
+            checkboxSelection=bool(use_checkbox),
+            headerCheckboxSelection=bool(use_checkbox and header_checkbox),
+            headerCheckboxSelectionFilteredOnly=False,
+        )
     builder.configure_column("vendor", header_name="店铺", width=160)
     builder.configure_column("description", header_name="明细", width=260)
     link_formatter, link_class, link_tooltip = build_product_link_helpers()
@@ -1604,11 +1808,12 @@ def render_preprocess_tab(orders_paths, config_path):
                 notice = f"已解析 {len(editor_df)} 条"
                 if removed_count:
                     notice += f"，自动去重 {removed_count} 条"
-                set_order_df(
+                apply_preprocess_change(
                     editor_df,
                     notice=notice,
                     reset_grid=True,
                     reset_row_ids=True,
+                    track_history=True,
                 )
             except Exception as exc:
                 st.error(f"解析失败：{exc}")
@@ -1637,6 +1842,35 @@ def render_preprocess_tab(orders_paths, config_path):
                 trigger_rerun()
             except Exception as exc:
                 st.error(f"导入失败：{exc}")
+
+    tools_col1, tools_col2, tools_col3, tools_col4 = st.columns([1, 1, 1, 1.2])
+    with tools_col1:
+        if st.button("暂存"):
+            try:
+                save_preprocess_cache()
+                st.session_state.preprocess_notice = "暂存成功"
+                trigger_rerun()
+            except Exception as exc:
+                st.error(f"暂存失败：{exc}")
+    undo_count = len(st.session_state.get("preprocess_undo_stack", []))
+    redo_count = len(st.session_state.get("preprocess_redo_stack", []))
+    with tools_col2:
+        if st.button("撤回", disabled=undo_count == 0):
+            if undo_preprocess_change():
+                trigger_rerun()
+    with tools_col3:
+        if st.button("重做", disabled=redo_count == 0):
+            if redo_preprocess_change():
+                trigger_rerun()
+    with tools_col4:
+        st.checkbox(
+            "自动保存",
+            key="preprocess_auto_save",
+            on_change=on_preprocess_auto_save_toggle,
+        )
+    st.caption(
+        f"撤回/重做最多保留 {PREPROCESS_HISTORY_LIMIT} 步：可撤回 {undo_count}，可重做 {redo_count}"
+    )
 
     if allow_edit:
         st.caption("双击单元格编辑，点击行后可删除当前行。")
@@ -1724,13 +1958,18 @@ def render_preprocess_tab(orders_paths, config_path):
         else:
             updated_df = updated_data
         updated_clean = ensure_editor_df(updated_df)
-        if not updated_clean.equals(display_base_df):
-            st.session_state.match_result_df = None
-            st.session_state.match_detail = {}
-        if display_base_df.shape[0] != current_df.shape[0]:
-            st.session_state.order_df = merge_grid_updates(current_df, updated_clean)
-        else:
-            st.session_state.order_df = updated_clean
+        display_clean = ensure_editor_df(display_base_df)
+        if not updated_clean.equals(display_clean):
+            if display_base_df.shape[0] != current_df.shape[0]:
+                next_df = merge_grid_updates(current_df, updated_clean)
+            else:
+                next_df = updated_clean
+            apply_preprocess_change(
+                next_df,
+                reset_grid=False,
+                reset_row_ids=False,
+                track_history=True,
+            )
 
     selected_rows = grid_response.get("selected_rows")
     if selected_rows is None:
@@ -1751,6 +1990,7 @@ def render_preprocess_tab(orders_paths, config_path):
     action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 1.3])
     with action_col1:
         if st.button("新增空行"):
+            next_row_id = st.session_state.order_row_id_seq
             new_row = {
                 "order_id": "",
                 "vendor": "",
@@ -1759,14 +1999,19 @@ def render_preprocess_tab(orders_paths, config_path):
                 "amount": None,
                 "order_status": "",
                 "order_date": "",
-                "_row_id": st.session_state.order_row_id_seq,
+                "_row_id": next_row_id,
             }
-            st.session_state.order_row_id_seq += 1
             new_df = pd.concat(
                 [st.session_state.order_df, pd.DataFrame([new_row])],
                 ignore_index=True,
             )
-            set_order_df(new_df, notice="已新增空行", reset_grid=True)
+            apply_preprocess_change(
+                new_df,
+                notice="已新增空行",
+                reset_grid=True,
+                reset_row_ids=False,
+                track_history=True,
+            )
             trigger_rerun()
     with action_col2:
         if st.button("删除选中"):
@@ -1776,24 +2021,32 @@ def render_preprocess_tab(orders_paths, config_path):
                 new_df = st.session_state.order_df[
                     ~st.session_state.order_df["_row_id"].isin(selected_ids)
                 ]
-                set_order_df(
+                apply_preprocess_change(
                     new_df,
                     notice=f"已删除 {len(selected_ids)} 行",
                     reset_grid=True,
+                    track_history=True,
                 )
                 trigger_rerun()
     with action_col3:
         if st.button("清空"):
             empty_df = pd.DataFrame(columns=EDITOR_COLUMNS)
-            set_order_df(empty_df, notice="已清空", reset_grid=True, reset_row_ids=True)
+            apply_preprocess_change(
+                empty_df,
+                notice="已清空",
+                reset_grid=True,
+                reset_row_ids=True,
+                track_history=True,
+            )
             trigger_rerun()
     with action_col4:
         if st.button("移除已报销订单", disabled=reimbursed_match_count == 0):
             new_df = st.session_state.order_df.loc[~reimbursed_mask_all].copy()
-            set_order_df(
+            apply_preprocess_change(
                 new_df,
                 notice=f"已移除 {reimbursed_match_count} 条已报销订单",
                 reset_grid=True,
+                track_history=True,
             )
             trigger_rerun()
     export_config = load_config(config_path)
@@ -1858,6 +2111,7 @@ def render_preprocess_tab(orders_paths, config_path):
 
         if st.button("添加"):
             amount_value = matcher.parse_amount(new_amount) if new_amount else None
+            next_row_id = st.session_state.order_row_id_seq
             new_row = {
                 "order_id": matcher.format_order_id(new_order_id),
                 "vendor": new_vendor.strip(),
@@ -1866,14 +2120,19 @@ def render_preprocess_tab(orders_paths, config_path):
                 "amount": amount_value if amount_value is not None else new_amount,
                 "order_status": new_status.strip(),
                 "order_date": new_date.strip(),
-                "_row_id": st.session_state.order_row_id_seq,
+                "_row_id": next_row_id,
             }
-            st.session_state.order_row_id_seq += 1
             new_df = pd.concat(
                 [st.session_state.order_df, pd.DataFrame([new_row])],
                 ignore_index=True,
             )
-            set_order_df(new_df, notice="已添加", reset_grid=True)
+            apply_preprocess_change(
+                new_df,
+                notice="已添加",
+                reset_grid=True,
+                reset_row_ids=False,
+                track_history=True,
+            )
             trigger_rerun()
 
 
