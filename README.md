@@ -466,12 +466,6 @@ python -m streamlit run streamlit_app.py --server.port 8501
 - **状态可恢复**：预处理与截图均支持本地暂存恢复
 - **配置可解释**：列映射与匹配规则集中管理
 
----
-
-## 10. 备注（关于“仓库标题”）
-
-本次已在 README 顶部给出建议标题。  
-GitHub 仓库真实标题（Repository name / Description）需要在 GitHub 网页端仓库设置中修改。
 
 ---
 
