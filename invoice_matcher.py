@@ -872,7 +872,21 @@ def compute_order_match_statuses(orders_df, invoices, matches, config):
         if key is not None:
             invoice_amount_counts[key] = invoice_amount_counts.get(key, 0) + 1
 
+    order_amount_counts = {}
+    for _, order in orders_df.iterrows():
+        key = amount_key(order.get("_amount"))
+        if key is not None:
+            order_amount_counts[key] = order_amount_counts.get(key, 0) + 1
+
     match_by_order = {int(item["order_row"]): item for item in matches}
+    manual_amount_keys = set()
+    for item in matches:
+        if not bool(item.get("manual_override", False)):
+            continue
+        key = amount_key(item.get("order_amount"))
+        if key is not None:
+            manual_amount_keys.add(key)
+
     status_map = {}
 
     for order_idx, order in orders_df.iterrows():
@@ -882,17 +896,52 @@ def compute_order_match_statuses(orders_df, invoices, matches, config):
             if order_amount_key is not None
             else 0
         )
+        same_amount_order_count = (
+            order_amount_counts.get(order_amount_key, 0)
+            if order_amount_key is not None
+            else 0
+        )
+        has_same_amount_orders = same_amount_order_count > 1
         matched = match_by_order.get(int(order_idx))
         matched_amount_ok = False
+        manual_override = False
         if matched:
             matched_amount_ok = amounts_equal(
                 order["_amount"], matched.get("invoice_amount")
             )
+            manual_override = bool(matched.get("manual_override", False))
 
-        if matched and matched_amount_ok and amount_match_count == 1:
+        amount_manually_resolved = order_amount_key in manual_amount_keys
+
+        if manual_override:
+            status = "手动匹配"
+            reason = "已人工确认并手动分配发票"
+            color = "green"
+        elif (
+            amount_manually_resolved
+            and has_same_amount_orders
+            and matched is None
+        ):
+            status = "无匹配"
+            reason = "同金额发票已手动分配，当前订单未分配"
+            color = "red"
+
+        elif (
+            matched
+            and matched_amount_ok
+            and amount_match_count == 1
+            and not has_same_amount_orders
+        ):
             status = "完美匹配"
             reason = "金额一致且唯一匹配"
             color = "green"
+        elif has_same_amount_orders and amount_match_count > 0:
+            status = "疑似匹配"
+            if matched:
+                reason = "存在同金额订单，建议人工确认分配"
+            else:
+                reason = "存在同金额订单，待人工分配发票"
+            color = "orange"
         elif amount_match_count > 1:
             status = "疑似匹配"
             reason = "金额对应多张发票"
@@ -911,6 +960,10 @@ def compute_order_match_statuses(orders_df, invoices, matches, config):
             "reason": reason,
             "color": color,
             "amount_match_count": amount_match_count,
+            "same_amount_order_count": same_amount_order_count,
+            "has_same_amount_orders": has_same_amount_orders,
+            "manual_override": manual_override,
+            "amount_manually_resolved": amount_manually_resolved,
         }
 
     return status_map

@@ -461,6 +461,18 @@ def ensure_session_state():
         st.session_state.match_result_df = None
     if "match_detail" not in st.session_state:
         st.session_state.match_detail = {}
+    if "match_orders_df" not in st.session_state:
+        st.session_state.match_orders_df = None
+    if "match_invoices" not in st.session_state:
+        st.session_state.match_invoices = []
+    if "match_matches" not in st.session_state:
+        st.session_state.match_matches = []
+    if "match_config_snapshot" not in st.session_state:
+        st.session_state.match_config_snapshot = {}
+    if "match_output_path" not in st.session_state:
+        st.session_state.match_output_path = str(DEFAULT_OUTPUT_PATH)
+    if "match_notice" not in st.session_state:
+        st.session_state.match_notice = ""
     if "summary" not in st.session_state:
         st.session_state.summary = None
     if "orders_paths_text" not in st.session_state:
@@ -876,6 +888,12 @@ def set_order_df(df, notice=None, reset_grid=False, reset_row_ids=False):
     st.session_state.order_df = df.reset_index(drop=True)
     st.session_state.match_result_df = None
     st.session_state.match_detail = {}
+    st.session_state.match_orders_df = None
+    st.session_state.match_invoices = []
+    st.session_state.match_matches = []
+    st.session_state.match_config_snapshot = {}
+    st.session_state.match_notice = ""
+    st.session_state.summary = None
     if reset_grid:
         st.session_state.order_grid_version += 1
     if notice:
@@ -1528,6 +1546,514 @@ def build_suspect_invoice_map(orders_df, invoices, config, matches):
     return suspect_map
 
 
+def clone_invoice_records(invoices):
+    cloned = []
+    for item in invoices or []:
+        if isinstance(item, dict):
+            cloned.append(dict(item))
+    return cloned
+
+
+def clone_match_records(matches):
+    cloned = []
+    for item in matches or []:
+        if isinstance(item, dict):
+            cloned.append(dict(item))
+    return cloned
+
+
+def normalize_match_bindings(orders_df, invoices, matches):
+    orders_work = orders_df.copy()
+    for column in ("_match_invoice_file", "_match_invoice_id", "_match_score"):
+        if column not in orders_work.columns:
+            orders_work[column] = None
+        else:
+            orders_work[column] = None
+
+    invoices_work = clone_invoice_records(invoices)
+    invoice_by_file = {}
+    for invoice in invoices_work:
+        invoice["match_order_row"] = None
+        invoice["match_order_id"] = ""
+        invoice["match_score"] = None
+        invoice_file = str(invoice.get("invoice_file") or "").strip()
+        if invoice_file:
+            invoice_by_file[invoice_file] = invoice
+
+    used_orders = set()
+    used_invoices = set()
+    normalized_matches = []
+    for item in clone_match_records(matches):
+        order_row_raw = item.get("order_row")
+        try:
+            order_row = int(order_row_raw)
+        except Exception:
+            continue
+        if order_row not in orders_work.index:
+            continue
+
+        invoice_file = str(item.get("invoice_file") or "").strip()
+        if not invoice_file:
+            continue
+        if order_row in used_orders or invoice_file in used_invoices:
+            continue
+
+        invoice = invoice_by_file.get(invoice_file)
+        if invoice is None:
+            continue
+
+        order = orders_work.loc[order_row]
+        raw_score = item.get("score")
+        try:
+            score = float(raw_score) if raw_score is not None else None
+        except Exception:
+            score = None
+
+        invoice["match_order_row"] = int(order_row)
+        invoice["match_order_id"] = str(order.get("_order_id") or "")
+        invoice["match_score"] = score
+
+        orders_work.at[order_row, "_match_invoice_file"] = invoice_file
+        orders_work.at[order_row, "_match_invoice_id"] = invoice.get("invoice_id", "")
+        orders_work.at[order_row, "_match_score"] = score
+
+        normalized = {
+            "invoice_file": invoice.get("invoice_file", ""),
+            "invoice_id": invoice.get("invoice_id", ""),
+            "invoice_amount": invoice.get("amount"),
+            "invoice_date": invoice.get("date"),
+            "invoice_vendor": invoice.get("vendor", ""),
+            "order_row": int(order_row),
+            "order_id": order.get("_order_id", ""),
+            "order_amount": order.get("_amount"),
+            "order_date": order.get("_date"),
+            "order_vendor": order.get("_vendor", ""),
+            "score": score,
+            "score_amount": item.get("score_amount"),
+            "score_date": item.get("score_date"),
+            "score_vendor": item.get("score_vendor"),
+            "manual_override": bool(item.get("manual_override", False)),
+        }
+        normalized_matches.append(normalized)
+        used_orders.add(order_row)
+        used_invoices.add(invoice_file)
+
+    return orders_work, invoices_work, normalized_matches
+
+
+def build_match_result_dataframe(orders_df):
+    result_df = pd.DataFrame(
+        {
+            "_order_row": orders_df.index.astype(int),
+            "order_id": orders_df["_order_id"].apply(matcher.format_order_id),
+            "vendor": orders_df["_vendor"],
+            "description": orders_df["_description"],
+            "product_link": orders_df.get("_product_link", ""),
+            "amount": orders_df["_amount"],
+            "order_status": orders_df["_status"],
+            "order_date": orders_df["_date"],
+            "match_status": orders_df["_match_status"],
+            "match_reason": orders_df["_match_reason"],
+        }
+    )
+    result_df["order_date"] = result_df["order_date"].apply(format_editor_date)
+    return result_df
+
+
+def apply_match_state_to_session(
+    orders_df,
+    invoices,
+    matches,
+    config,
+    output_path,
+    notice=None,
+    persist_output=False,
+):
+    orders_work, invoices_work, matches_work = normalize_match_bindings(
+        orders_df, invoices, matches
+    )
+    status_map = matcher.compute_order_match_statuses(
+        orders_work, invoices_work, matches_work, config
+    )
+    orders_work["_match_status"] = orders_work.index.map(
+        lambda idx: status_map.get(idx, {}).get("status", "")
+    )
+    orders_work["_match_reason"] = orders_work.index.map(
+        lambda idx: status_map.get(idx, {}).get("reason", "")
+    )
+
+    result_df = build_match_result_dataframe(orders_work)
+    detail = {
+        "suspect_map": build_suspect_invoice_map(
+            orders_work, invoices_work, config, matches_work
+        ),
+        "order_invoice_map": build_order_invoice_map(matches_work),
+        "unmatched_invoices": [
+            inv for inv in invoices_work if inv.get("match_order_row") is None
+        ],
+        "status_map": status_map,
+    }
+
+    order_total = sum_amounts(orders_work["_amount"])
+    matched_total = sum_amounts(
+        orders_work.loc[
+            orders_work["_match_status"].isin(["完美匹配", "手动匹配"]),
+            "_amount",
+        ]
+    )
+    summary = {
+        "orders": len(orders_work),
+        "invoices": len(invoices_work),
+        "matches": len(matches_work),
+        "output": str(output_path),
+        "order_total": order_total,
+        "matched_total": matched_total,
+    }
+
+    st.session_state.match_orders_df = orders_work
+    st.session_state.match_invoices = invoices_work
+    st.session_state.match_matches = matches_work
+    st.session_state.match_config_snapshot = dict(config or {})
+    st.session_state.match_output_path = str(output_path)
+    st.session_state.match_result_df = result_df
+    st.session_state.match_detail = detail
+    st.session_state.summary = summary
+
+    if notice:
+        st.session_state.match_notice = notice
+
+    if persist_output:
+        try:
+            matcher.write_output(output_path, orders_work, invoices_work, matches_work)
+        except Exception as exc:
+            st.session_state.match_notice = f"写入匹配结果失败：{exc}"
+
+
+def get_invoice_by_file(invoices, invoice_file):
+    target = str(invoice_file or "").strip()
+    if not target:
+        return None
+    for invoice in invoices or []:
+        current = str((invoice or {}).get("invoice_file") or "").strip()
+        if current == target:
+            return invoice
+    return None
+
+
+def compute_order_invoice_pair_scores(order, invoice, config):
+    rules = (config or {}).get("match_rules", {})
+    weights = rules.get("weights", {})
+    weight_amount = float(weights.get("amount", 0.6))
+    weight_date = float(weights.get("date", 0.2))
+    weight_vendor = float(weights.get("vendor", 0.2))
+    tol_abs = rules.get("amount_tolerance", 0.0)
+    tol_ratio = rules.get("amount_tolerance_ratio", 0.0)
+    tol_days = int(rules.get("date_days_tolerance", 0))
+
+    amount_score = matcher.score_amount(
+        invoice.get("amount"), order.get("_amount"), tol_abs, tol_ratio
+    )
+    date_score = matcher.score_date(invoice.get("date"), order.get("_date"), tol_days)
+    vendor_score = matcher.score_vendor(invoice.get("vendor"), order.get("_vendor"))
+
+    score_sum = 0.0
+    weight_sum = 0.0
+    if amount_score is not None:
+        score_sum += weight_amount * amount_score
+        weight_sum += weight_amount
+    if date_score is not None:
+        score_sum += weight_date * date_score
+        weight_sum += weight_date
+    if vendor_score is not None:
+        score_sum += weight_vendor * vendor_score
+        weight_sum += weight_vendor
+    total_score = (score_sum / weight_sum) if weight_sum else 0.0
+
+    return {
+        "score": total_score,
+        "score_amount": amount_score,
+        "score_date": date_score,
+        "score_vendor": vendor_score,
+    }
+
+
+def assign_invoice_to_order_match(order_row, invoice_file):
+    orders_df = st.session_state.get("match_orders_df")
+    if not isinstance(orders_df, pd.DataFrame) or orders_df.empty:
+        return False, "暂无可操作的匹配结果"
+
+    try:
+        order_row = int(order_row)
+    except Exception:
+        return False, "订单行号无效"
+    if order_row not in orders_df.index:
+        return False, "订单不存在"
+
+    invoices = clone_invoice_records(st.session_state.get("match_invoices", []))
+    invoice = get_invoice_by_file(invoices, invoice_file)
+    if invoice is None:
+        return False, "未找到对应发票"
+
+    matches = clone_match_records(st.session_state.get("match_matches", []))
+    filtered_matches = []
+    for item in matches:
+        try:
+            item_order_row = int(item.get("order_row"))
+        except Exception:
+            item_order_row = None
+        item_invoice_file = str(item.get("invoice_file") or "").strip()
+        if item_order_row == order_row:
+            continue
+        if item_invoice_file and item_invoice_file == str(invoice_file).strip():
+            continue
+        filtered_matches.append(item)
+
+    order = orders_df.loc[order_row]
+    config = st.session_state.get("match_config_snapshot") or {}
+    pair_scores = compute_order_invoice_pair_scores(order, invoice, config)
+    filtered_matches.append(
+        {
+            "invoice_file": invoice.get("invoice_file", ""),
+            "invoice_id": invoice.get("invoice_id", ""),
+            "invoice_amount": invoice.get("amount"),
+            "invoice_date": invoice.get("date"),
+            "invoice_vendor": invoice.get("vendor", ""),
+            "order_row": int(order_row),
+            "order_id": order.get("_order_id", ""),
+            "order_amount": order.get("_amount"),
+            "order_date": order.get("_date"),
+            "order_vendor": order.get("_vendor", ""),
+            "score": pair_scores.get("score"),
+            "score_amount": pair_scores.get("score_amount"),
+            "score_date": pair_scores.get("score_date"),
+            "score_vendor": pair_scores.get("score_vendor"),
+            "manual_override": True,
+        }
+    )
+
+    output_path = st.session_state.get(
+        "match_output_path", st.session_state.get("output_path", str(DEFAULT_OUTPUT_PATH))
+    )
+    apply_match_state_to_session(
+        orders_df,
+        invoices,
+        filtered_matches,
+        config,
+        output_path,
+        notice=f"已手动分配发票：{Path(str(invoice_file)).name}",
+        persist_output=True,
+    )
+    return True, None
+
+
+def remove_order_match_assignment(order_row):
+    orders_df = st.session_state.get("match_orders_df")
+    if not isinstance(orders_df, pd.DataFrame) or orders_df.empty:
+        return False, "暂无可操作的匹配结果"
+
+    try:
+        order_row = int(order_row)
+    except Exception:
+        return False, "订单行号无效"
+
+    matches = clone_match_records(st.session_state.get("match_matches", []))
+    original_len = len(matches)
+    kept = []
+    for item in matches:
+        try:
+            item_order_row = int(item.get("order_row"))
+        except Exception:
+            item_order_row = None
+        if item_order_row == order_row:
+            continue
+        kept.append(item)
+
+    if len(kept) == original_len:
+        return False, "当前订单没有已分配发票"
+
+    invoices = clone_invoice_records(st.session_state.get("match_invoices", []))
+    config = st.session_state.get("match_config_snapshot") or {}
+    output_path = st.session_state.get(
+        "match_output_path", st.session_state.get("output_path", str(DEFAULT_OUTPUT_PATH))
+    )
+    apply_match_state_to_session(
+        orders_df,
+        invoices,
+        kept,
+        config,
+        output_path,
+        notice="已删除当前订单匹配发票",
+        persist_output=True,
+    )
+    return True, None
+
+
+def build_manual_invoice_candidates(order_row):
+    invoices = clone_invoice_records(st.session_state.get("match_invoices", []))
+    if not invoices:
+        return []
+
+    orders_df = st.session_state.get("match_orders_df")
+    if not isinstance(orders_df, pd.DataFrame) or orders_df.empty:
+        return invoices
+
+    try:
+        order_row = int(order_row)
+    except Exception:
+        return invoices
+    if order_row not in orders_df.index:
+        return invoices
+
+    detail = st.session_state.get("match_detail", {})
+    order_invoice_map = detail.get("order_invoice_map", {})
+    suspect_map = detail.get("suspect_map", {})
+    unmatched_invoices = detail.get("unmatched_invoices", [])
+
+    order = orders_df.loc[order_row]
+    amount_key = matcher.amount_key(order.get("_amount"))
+
+    candidates = []
+    seen = set()
+
+    def add_items(items):
+        for item in items or []:
+            invoice_file = str((item or {}).get("invoice_file") or "").strip()
+            if not invoice_file or invoice_file in seen:
+                continue
+            invoice = get_invoice_by_file(invoices, invoice_file)
+            if invoice is None:
+                continue
+            candidates.append(invoice)
+            seen.add(invoice_file)
+
+    current = order_invoice_map.get(order_row)
+    if current:
+        add_items([current])
+
+    add_items(suspect_map.get(order_row, []))
+
+    same_amount = []
+    if amount_key is not None:
+        for invoice in invoices:
+            if matcher.amount_key(invoice.get("amount")) == amount_key:
+                same_amount.append(invoice)
+    add_items(same_amount)
+
+    add_items(unmatched_invoices)
+    add_items(invoices)
+    return candidates
+
+
+def format_invoice_candidate_label(invoice):
+    invoice_file = str((invoice or {}).get("invoice_file") or "")
+    name = Path(invoice_file).name if invoice_file else "未知发票"
+    invoice_id = str((invoice or {}).get("invoice_id") or "").strip() or "无票号"
+    amount = invoice.get("amount")
+    amount_text = "-" if amount is None else format_amount(amount)
+    date_text = format_editor_date(invoice.get("date"))
+    vendor_text = str((invoice or {}).get("vendor") or "").strip() or "-"
+    assigned_row = invoice.get("match_order_row")
+    assigned_text = "未分配"
+    if assigned_row is not None:
+        assigned_text = f"已分配给订单行 {assigned_row}"
+    return (
+        f"{name} | {invoice_id} | 金额 {amount_text} | 日期 {date_text} | "
+        f"商家 {vendor_text} | {assigned_text}"
+    )
+
+
+def render_selected_match_actions(selected_row):
+    order_row = selected_row.get("_order_row")
+    try:
+        order_row = int(order_row)
+    except Exception:
+        st.warning("当前选中行无效")
+        return
+
+    detail = st.session_state.get("match_detail", {})
+    order_invoice_map = detail.get("order_invoice_map", {})
+    current_match = order_invoice_map.get(order_row)
+    candidates = build_manual_invoice_candidates(order_row)
+    candidate_files = [str(item.get("invoice_file") or "") for item in candidates]
+    candidate_files = [item for item in candidate_files if item]
+
+    with st.expander("匹配操作", expanded=True):
+        info_cols = st.columns([2.2, 1.4, 1.4])
+        with info_cols[0]:
+            st.caption(f"订单号：{selected_row.get('order_id', '')}")
+            st.caption(f"金额：{format_amount(selected_row.get('amount'))}")
+        with info_cols[1]:
+            st.caption(f"状态：{selected_row.get('match_status', '')}")
+            st.caption(f"原因：{selected_row.get('match_reason', '')}")
+        with info_cols[2]:
+            if current_match:
+                st.caption(f"当前发票：{describe_invoice(current_match)}")
+            else:
+                st.caption("当前发票：未分配")
+
+        current_col1, current_col2, current_col3 = st.columns([1.2, 1.2, 2.6])
+        with current_col1:
+            if st.button(
+                "打开当前发票",
+                key=f"open_current_invoice_{order_row}",
+                disabled=current_match is None,
+                use_container_width=True,
+            ):
+                open_pdf_file(current_match.get("invoice_file", ""))
+        with current_col2:
+            if st.button(
+                "删除当前匹配",
+                key=f"remove_current_invoice_{order_row}",
+                disabled=current_match is None,
+                use_container_width=True,
+            ):
+                ok, msg = remove_order_match_assignment(order_row)
+                if ok:
+                    trigger_rerun()
+                else:
+                    st.warning(msg or "删除失败")
+        with current_col3:
+            if not candidate_files:
+                st.caption("无可分配发票")
+            else:
+                selected_invoice_file = st.selectbox(
+                    "手动分配发票",
+                    options=candidate_files,
+                    format_func=lambda value: format_invoice_candidate_label(
+                        get_invoice_by_file(candidates, value) or {}
+                    ),
+                    key=f"manual_assign_invoice_{order_row}",
+                    label_visibility="collapsed",
+                )
+                if st.button(
+                    "分配给当前订单",
+                    key=f"assign_invoice_{order_row}",
+                    use_container_width=True,
+                ):
+                    ok, msg = assign_invoice_to_order_match(
+                        order_row, selected_invoice_file
+                    )
+                    if ok:
+                        trigger_rerun()
+                    else:
+                        st.warning(msg or "分配失败")
+
+        if candidates:
+            with st.expander("候选发票列表", expanded=False):
+                for idx, invoice in enumerate(candidates):
+                    invoice_file = str(invoice.get("invoice_file") or "")
+                    row_cols = st.columns([6.2, 1, 1])
+                    row_cols[0].caption(format_invoice_candidate_label(invoice))
+                    if row_cols[1].button("打开", key=f"open_candidate_{order_row}_{idx}"):
+                        open_pdf_file(invoice_file)
+                    if row_cols[2].button("分配", key=f"assign_candidate_{order_row}_{idx}"):
+                        ok, msg = assign_invoice_to_order_match(order_row, invoice_file)
+                        if ok:
+                            trigger_rerun()
+                        else:
+                            st.warning(msg or "分配失败")
+
+
 def start_auto_shutdown_monitor():
     global AUTO_SHUTDOWN_STARTED
     if AUTO_SHUTDOWN_STARTED:
@@ -1876,6 +2402,9 @@ def build_match_grid_options(
                     }}
                     if (params.value === '疑似匹配') {{
                         return {{'backgroundColor': '{color_map.get("疑似匹配", "#ffe9c6")}', 'color': '#000'}};
+                    }}
+                    if (params.value === '手动匹配') {{
+                        return {{'backgroundColor': '{color_map.get("手动匹配", color_map.get("完美匹配", "#d6f5d6"))}', 'color': '#000'}};
                     }}
                     if (params.value === '无匹配') {{
                         return {{'backgroundColor': '{color_map.get("无匹配", "#ffd6d6")}', 'color': '#000'}};
@@ -2685,8 +3214,12 @@ def render_preprocess_tab(orders_paths, config_path):
 def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive, color_map):
     st.subheader("发票匹配与复核")
     orders_hint = f"{len(orders_paths)} 个文件" if orders_paths else "未选择"
-    st.caption(f"订单：{orders_hint} ｜ 发票：{pdf_dir}")
+    st.caption(f"订单：{orders_hint} | 发票：{pdf_dir}")
     matched_orders_for_screenshots = pd.DataFrame()
+
+    if st.session_state.get("match_notice"):
+        st.success(st.session_state.match_notice)
+        st.session_state.match_notice = ""
 
     auto_start_match = bool(st.session_state.pop("pending_match_auto_start", False))
     if st.button("开始匹配") or auto_start_match:
@@ -2694,7 +3227,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
         try:
             backend = matcher.resolve_pdf_backend()
             if backend is None:
-                st.error("缺少 PDF 解析库")
+                st.error("缺少 PDF 解析依赖")
                 return
 
             if st.session_state.order_df is not None and not st.session_state.order_df.empty:
@@ -2713,7 +3246,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
 
             pdfs = matcher.find_pdfs(pdf_dir, recursive)
             if not pdfs:
-                st.error("未找到 PDF")
+                st.error("未找到 PDF 发票文件")
                 return
 
             progress = st.progress(0)
@@ -2723,88 +3256,64 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                 progress.progress(idx / len(pdfs))
 
             matches = matcher.match_orders_invoices(orders_df, invoices, config)
-            status_map = matcher.compute_order_match_statuses(
-                orders_df, invoices, matches, config
+            apply_match_state_to_session(
+                orders_df,
+                invoices,
+                matches,
+                config,
+                output_path,
+                notice="匹配完成",
+                persist_output=True,
             )
-            orders_df["_match_status"] = orders_df.index.map(
-                lambda idx: status_map.get(idx, {}).get("status", "")
-            )
-            orders_df["_match_reason"] = orders_df.index.map(
-                lambda idx: status_map.get(idx, {}).get("reason", "")
-            )
-            matcher.write_output(output_path, orders_df, invoices, matches)
-
-            result_df = pd.DataFrame(
-                {
-                    "_order_row": orders_df.index.astype(int),
-                    "order_id": orders_df["_order_id"].apply(matcher.format_order_id),
-                    "vendor": orders_df["_vendor"],
-                    "description": orders_df["_description"],
-                    "product_link": orders_df.get("_product_link", ""),
-                    "amount": orders_df["_amount"],
-                    "order_status": orders_df["_status"],
-                    "order_date": orders_df["_date"],
-                    "match_status": orders_df["_match_status"],
-                    "match_reason": orders_df["_match_reason"],
-                }
-            )
-            result_df["order_date"] = result_df["order_date"].apply(format_editor_date)
-
-            st.session_state.match_result_df = result_df
-            st.session_state.match_detail = {
-                "suspect_map": build_suspect_invoice_map(
-                    orders_df, invoices, config, matches
-                ),
-                "order_invoice_map": build_order_invoice_map(matches),
-                "unmatched_invoices": [
-                    inv for inv in invoices if inv.get("match_order_row") is None
-                ],
-            }
-            order_total = sum_amounts(orders_df["_amount"])
-            perfect_total = sum_amounts(
-                orders_df.loc[orders_df["_match_status"] == "完美匹配", "_amount"]
-            )
-            st.session_state.summary = {
-                "orders": len(orders_df),
-                "invoices": len(invoices),
-                "matches": len(matches),
-                "output": output_path,
-                "order_total": order_total,
-                "perfect_total": perfect_total,
-            }
-            st.success("完成")
+            st.success("匹配完成")
         except Exception as exc:
-            st.error(f"失败：{exc}")
+            st.error(f"匹配失败：{exc}")
 
     if st.session_state.summary:
         summary = st.session_state.summary
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("订单", summary["orders"])
         m2.metric("发票", summary["invoices"])
-        m3.metric("匹配", summary["matches"])
+        m3.metric("已分配", summary["matches"])
         m4.metric("订单总金额", format_amount(summary.get("order_total", 0.0)))
-        m5.metric("完美匹配金额", format_amount(summary.get("perfect_total", 0.0)))
+        m5.metric(
+            "已匹配金额",
+            format_amount(summary.get("matched_total", summary.get("perfect_total", 0.0))),
+        )
         st.caption(f"输出：{Path(summary['output']).name}")
 
+        status_map = st.session_state.get("match_detail", {}).get("status_map", {})
+        same_amount_conflicts = [
+            idx
+            for idx, item in (status_map or {}).items()
+            if (
+                item.get("has_same_amount_orders")
+                and item.get("amount_match_count", 0) > 0
+                and not item.get("amount_manually_resolved", False)
+            )
+        ]
+        if same_amount_conflicts:
+            st.warning(
+                f"检测到 {len(same_amount_conflicts)} 条同金额订单冲突，已标记为疑似匹配，请在下方手动确认。"
+            )
+
     if st.session_state.match_result_df is not None:
-        st.markdown("### 结果")
-        st.caption("点击“疑似匹配”行可查看疑似发票列表。")
-        status_filter = st.selectbox(
-            "状态筛选",
-            options=["全部"]
-            + sorted(
-                {
-                    value
-                    for value in st.session_state.match_result_df["order_status"].dropna().unique()
-                    if str(value).strip()
-                }
-            ),
+        st.markdown("### 匹配结果")
+        all_result_df = st.session_state.match_result_df.copy()
+        status_options = ["全部"] + sorted(
+            {
+                value
+                for value in all_result_df["match_status"].dropna().unique()
+                if str(value).strip()
+            }
         )
-        view_df = st.session_state.match_result_df.copy()
+        status_filter = st.selectbox("状态筛选", options=status_options)
+        view_df = all_result_df.copy()
         if status_filter != "全部":
-            view_df = view_df[view_df["order_status"] == status_filter]
+            view_df = view_df[view_df["match_status"] == status_filter]
         view_df = add_auto_unique_id_column(view_df)
 
+        selected = None
         if AGGRID_AVAILABLE:
             selected_row_id = st.session_state.get("match_selected_row_id")
             grid_response = AgGrid(
@@ -2826,37 +3335,23 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                 selected_rows = []
             elif isinstance(selected_rows, pd.DataFrame):
                 selected_rows = selected_rows.to_dict("records")
-
             selected = resolve_selected_row(
                 selected_rows, view_df, "_order_row", "match_selected_row_id"
             )
-            if selected:
-                if selected.get("match_status") == "疑似匹配":
-                    detail = st.session_state.get("match_detail", {})
-                    suspect_map = detail.get("suspect_map", {})
-                    order_row = selected.get("_order_row")
-                    suspects = suspect_map.get(int(order_row), []) if order_row is not None else []
-                    with st.expander("疑似发票", expanded=True):
-                        if not suspects:
-                            st.caption("未找到疑似发票")
-                        else:
-                            for idx, invoice in enumerate(suspects):
-                                label = describe_invoice(invoice)
-                                if st.button(
-                                    label,
-                                    key=f"suspect_open_{order_row}_{idx}",
-                                ):
-                                    open_pdf_file(invoice.get("invoice_file", ""))
-
         else:
             st.dataframe(
                 view_df.style.apply(lambda r: style_match_rows(r, color_map), axis=1),
                 use_container_width=True,
                 height=520,
             )
+            st.caption("当前环境不支持表格交互，无法使用手动分配功能。")
 
-        matched_orders = view_df[view_df["match_status"] == "完美匹配"].copy()
+        if selected:
+            render_selected_match_actions(selected)
 
+        matched_orders = all_result_df[
+            all_result_df["match_status"].isin(["完美匹配", "手动匹配"])
+        ].copy()
         if not matched_orders.empty:
             order_invoice_map = st.session_state.match_detail.get("order_invoice_map", {})
             matched_orders["invoice_file"] = matched_orders["_order_row"].map(
@@ -2866,6 +3361,7 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                 lambda idx: order_invoice_map.get(int(idx), {}).get("invoice_id", "")
             )
         matched_orders_for_screenshots = matched_orders.copy()
+
         export_col1, export_col2, export_col3 = st.columns([1, 1, 2])
         with export_col1:
             csv_data = matched_orders.to_csv(index=False, encoding="utf-8-sig")
@@ -2897,15 +3393,15 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         with export_col3:
-            st.caption(f"已匹配 {len(matched_orders)} 行")
+            st.caption(f"可用于截图归档的已匹配订单（含手动匹配）：{len(matched_orders)} 条")
 
     if st.session_state.match_result_df is not None:
         detail = st.session_state.get("match_detail", {})
         unmatched_invoices = detail.get("unmatched_invoices", [])
         if unmatched_invoices:
-            with st.expander(f"未匹配发票 ({len(unmatched_invoices)})", expanded=False):
+            with st.expander(f"未分配发票（{len(unmatched_invoices)}）", expanded=False):
                 for idx, invoice in enumerate(unmatched_invoices):
-                    label = describe_invoice(invoice)
+                    label = format_invoice_candidate_label(invoice)
                     if st.button(label, key=f"unmatched_open_{idx}"):
                         open_pdf_file(invoice.get("invoice_file", ""))
 
@@ -2915,13 +3411,18 @@ def render_match_tab(orders_paths, pdf_dir, config_path, output_path, recursive,
         or matched_orders_for_screenshots.empty
     )
     if st.button("进入截图管理", disabled=jump_disabled):
-        st.session_state.screenshot_prefill_df = matched_orders_for_screenshots
+        st.session_state.screenshot_prefill_df = matched_orders_for_screenshots.copy()
+        st.session_state.screenshot_orders_df = matched_orders_for_screenshots.copy()
+        st.session_state.screenshot_force_prefill = True
+        st.session_state.screenshot_uploader_nonce = (
+            int(st.session_state.get("screenshot_uploader_nonce", 0)) + 1
+        )
         st.session_state.pending_tab = "截图"
         trigger_rerun()
     if st.session_state.match_result_df is None:
         st.caption("请先完成匹配后进入截图管理。")
     elif matched_orders_for_screenshots.empty:
-        st.caption("没有可进入截图管理的完美匹配订单。")
+        st.caption("当前没有可进入截图管理的已匹配订单。")
 
 
 def load_matched_orders_file(uploaded_file):
@@ -3139,6 +3640,7 @@ def main():
         "完美匹配": st.session_state.color_perfect,
         "疑似匹配": st.session_state.color_suspect,
         "无匹配": st.session_state.color_nomatch,
+        "手动匹配": st.session_state.color_perfect,
     }
 
     active_tab = render_main_navigation()
