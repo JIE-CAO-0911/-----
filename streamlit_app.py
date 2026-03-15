@@ -1119,18 +1119,94 @@ def ensure_screenshot_df_for_cache(df):
     return working
 
 
+def iter_screenshot_image_values(items):
+    if isinstance(items, dict):
+        def sort_key(item):
+            key = item[0]
+            text = str(key).strip()
+            if text.isdigit():
+                return (0, int(text))
+            return (1, text)
+
+        for _, value in sorted(items.items(), key=sort_key):
+            yield value
+        return
+    if isinstance(items, (list, tuple)):
+        for value in items:
+            yield value
+        return
+    return
+
+
+def coerce_screenshot_image_bytes(value):
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.startswith("data:image") and "," in text:
+            text = text.split(",", 1)[1].strip()
+        if len(text) < 24:
+            return None
+        try:
+            data = base64.b64decode(text.encode("ascii"), validate=False)
+        except Exception:
+            return None
+    else:
+        return None
+
+    if not data:
+        return None
+    return data
+
+
+def normalize_screenshot_store_state(store=None, persist=True):
+    source = store
+    if source is None:
+        source = st.session_state.get("screenshot_store", {})
+    if not isinstance(source, dict):
+        source = {}
+
+    normalized = {}
+    for order_key, entry in source.items():
+        safe_key = str(order_key)
+        safe_entry = entry if isinstance(entry, dict) else {}
+        order_images = []
+        payment_images = []
+        for raw in iter_screenshot_image_values(safe_entry.get(shots.CATEGORY_ORDER, [])):
+            img = coerce_screenshot_image_bytes(raw)
+            if img is not None:
+                order_images.append(img)
+        for raw in iter_screenshot_image_values(safe_entry.get(shots.CATEGORY_PAYMENT, [])):
+            img = coerce_screenshot_image_bytes(raw)
+            if img is not None:
+                payment_images.append(img)
+        normalized[safe_key] = {
+            shots.CATEGORY_ORDER: order_images,
+            shots.CATEGORY_PAYMENT: payment_images,
+        }
+
+    if persist:
+        st.session_state.screenshot_store = normalized
+    return normalized
+
+
 def serialize_screenshot_store(store):
     serialized = {}
-    for order_key, entry in (store or {}).items():
+    normalized_store = normalize_screenshot_store_state(store=store, persist=False)
+    for order_key, entry in normalized_store.items():
         safe_key = str(order_key)
         order_images = []
         payment_images = []
-        for img in entry.get(shots.CATEGORY_ORDER, []):
-            if isinstance(img, (bytes, bytearray)):
-                order_images.append(base64.b64encode(bytes(img)).decode("ascii"))
-        for img in entry.get(shots.CATEGORY_PAYMENT, []):
-            if isinstance(img, (bytes, bytearray)):
-                payment_images.append(base64.b64encode(bytes(img)).decode("ascii"))
+        for raw in iter_screenshot_image_values(entry.get(shots.CATEGORY_ORDER, [])):
+            img = coerce_screenshot_image_bytes(raw)
+            if img is not None:
+                order_images.append(base64.b64encode(img).decode("ascii"))
+        for raw in iter_screenshot_image_values(entry.get(shots.CATEGORY_PAYMENT, [])):
+            img = coerce_screenshot_image_bytes(raw)
+            if img is not None:
+                payment_images.append(base64.b64encode(img).decode("ascii"))
         serialized[safe_key] = {
             shots.CATEGORY_ORDER: order_images,
             shots.CATEGORY_PAYMENT: payment_images,
@@ -1139,31 +1215,7 @@ def serialize_screenshot_store(store):
 
 
 def deserialize_screenshot_store(data):
-    store = {}
-    if not isinstance(data, dict):
-        return store
-    for order_key, entry in data.items():
-        order_list = []
-        payment_list = []
-        for encoded in (entry or {}).get(shots.CATEGORY_ORDER, []):
-            if not isinstance(encoded, str):
-                continue
-            try:
-                order_list.append(base64.b64decode(encoded.encode("ascii")))
-            except Exception:
-                continue
-        for encoded in (entry or {}).get(shots.CATEGORY_PAYMENT, []):
-            if not isinstance(encoded, str):
-                continue
-            try:
-                payment_list.append(base64.b64decode(encoded.encode("ascii")))
-            except Exception:
-                continue
-        store[str(order_key)] = {
-            shots.CATEGORY_ORDER: order_list,
-            shots.CATEGORY_PAYMENT: payment_list,
-        }
-    return store
+    return normalize_screenshot_store_state(store=data, persist=False)
 
 
 def snapshot_from_screenshot_state(df=None, store=None):
@@ -1227,6 +1279,7 @@ def restore_screenshot_snapshot(snapshot, notice=None):
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
     st.session_state.screenshot_orders_df = ensure_screenshot_df_for_cache(df)
     st.session_state.screenshot_store = deserialize_screenshot_store(store_data)
+    normalize_screenshot_store_state()
     if notice:
         st.session_state.screenshot_notice = notice
 
@@ -3441,6 +3494,7 @@ def render_screenshot_tab():
     if st.session_state.get("screenshot_notice"):
         st.success(st.session_state.screenshot_notice)
         st.session_state.screenshot_notice = ""
+    normalize_screenshot_store_state()
 
     if not AGGRID_AVAILABLE:
         st.error("未安装可编辑表格组件：streamlit-aggrid")
